@@ -1,6 +1,7 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List
 import string
+import jsonpickle
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
@@ -9,8 +10,13 @@ class Trader:
 
     def run(self, state: TradingState):
         result = {}
-        traderData = state.traderData
-        conversions = 0  # No FX involved for now
+        conversions = 0
+
+        # Load persistent state
+        if state.traderData:
+            memory = jsonpickle.decode(state.traderData)
+        else:
+            memory = {"mid_prices": [], "ema": None}
 
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
@@ -26,32 +32,40 @@ class Trader:
 
             # === STRATEGY PER PRODUCT ===
             if product in ["RAINFOREST_RESIN", "KELP"]:
-                # Market making strategy
                 if spread > 2:
                     bid_price = int(mid_price - 1)
                     ask_price = int(mid_price + 1)
 
-                    # Small volume to reduce risk exposure
-                    orders.append(Order(product, bid_price, 2))   # Buy
-                    orders.append(Order(product, ask_price, -2))  # Sell
+                    orders.append(Order(product, bid_price, 2))
+                    orders.append(Order(product, ask_price, -2))
 
             elif product == "SQUID_INK":
-                # Mean reversion strategy
-                short_term_ma = 1970  # Can be dynamically updated with traderData
-                threshold = 40        # Threshold to trigger reversal trades
+                # EMA update
+                alpha = 0.17  # Smoothing factor; can be tuned
+
+                prev_ema = memory.get("ema")
+                if prev_ema is None:
+                    ema = mid_price  # Initialize
+                else:
+                    ema = alpha * mid_price + (1 - alpha) * prev_ema
+
+                memory["ema"] = ema
+                memory.setdefault("mid_prices", []).append(mid_price)
+
+                threshold = 40
+                short_term_ma = ema  # Use EMA as moving average
 
                 if mid_price < short_term_ma - threshold:
-                    # Price is undervalued → Buy expecting mean reversion
-                    orders.append(Order(product, best_ask, 3))  # Buy 3 at ask
+                    orders.append(Order(product, best_ask, 3))
 
                 elif mid_price > short_term_ma + threshold:
-                    # Price is overvalued → Sell expecting reversion
-                    orders.append(Order(product, best_bid, -3))  # Sell 3 at bid
+                    orders.append(Order(product, best_bid, -3))
 
             result[product] = orders
 
+        # Save persistent memory
+        traderData = jsonpickle.encode(memory)
         return result, conversions, traderData
-
 
 
 

@@ -6,12 +6,36 @@ import numpy as np
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import math
 
-import numpy as np
-import matplotlib.pyplot as plt
-seconds = 24 * 3600
-no_samples = 1e6 / 100
-sampling_frequency = no_samples / seconds
+
+def plot_ema_lowpass(df: pd.DataFrame, fc: float = 0.005, fs: float = 10000 / (24 * 2600)):
+    numeric_cols = df.select_dtypes(include='number').columns
+
+    if fs <= 0 or fc <= 0:
+        raise ValueError("Sampling and cutoff frequencies must be positive.")
+
+    alpha = (2 * math.pi * fc) / (2 * math.pi * fc + fs)
+    print(f"Alpha: {alpha}")
+
+    for col in numeric_cols:
+        series = df[col].dropna()
+        print(series)
+
+        # Apply EMA
+        smoothed = series.ewm(alpha=alpha, adjust=False).mean()
+
+        # Plotting
+        plt.figure(figsize=(10, 4))
+        plt.plot(series.index, series, label='Original', alpha=0.5)
+        plt.plot(smoothed.index, smoothed, label=f'EMA Lowpass (fc={fc} Hz)', linewidth=2)
+        plt.title(f"{col} - EMA Low-Pass Filter")
+        plt.xlabel("Index")
+        plt.ylabel(col)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
 
 def plot_product_data(product_dfs):
     for product_name, df in product_dfs.items():
@@ -57,7 +81,7 @@ def plot_moving_average(df, window_size=5):
         plt.tight_layout()
         plt.show()
 
-def compute_and_plot_fft(df, fs=sampling_frequency, bin_width=0.001):
+def compute_and_plot_fft(df, fs, bin_width=0.001):
     numeric_cols = df.select_dtypes(include=[np.number]).columns
 
     for col in numeric_cols:
@@ -156,14 +180,19 @@ def walk_and_process(base_path):
     return dataframes
 
 if __name__ == "__main__":
+    
+    seconds = 24 * 3600
+    no_samples = 1e6 / 100
+    sampling_frequency = no_samples / seconds
     # Set your base directory here
     base_dir = "sample_data"
     dataframe_dicts = walk_and_process(base_dir)
     #vplot_product_data(dataframe_dicts[0])
     # compute_and_plot_fft(dataframe_dicts[0]["KELP"])  # Example: compute FFT for the first dataframe
-    max_freq = 0.01
+    max_freq = 0.01 * 0.1
     window_size = int(0.5 * sampling_frequency/max_freq)
     print(f"Window size: {window_size}")
     # window_size = 10
-    plot_moving_average(dataframe_dicts[0]["KELP"], window_size=window_size)  # Example: plot moving average for the first dataframe
+    # plot_moving_average(dataframe_dicts[0]["KELP"], window_size=window_size)  # Example: plot moving average for the first dataframe
+    plot_ema_lowpass(dataframe_dicts[0]["KELP"], fc=0.01 * 0.5, fs=sampling_frequency)  # Example: plot EMA lowpass for the first dataframe
     print(window_size)
