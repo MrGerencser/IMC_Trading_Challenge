@@ -157,7 +157,7 @@ def walk_and_process(base_path):
 
 if __name__ == "__main__":
     # Set your base directory here
-    base_dir = "sample_data"
+    base_dir = "sample_data/round-2-island-data-bottle/"
     dataframe_dicts = walk_and_process(base_dir)
     #vplot_product_data(dataframe_dicts[0])
     # compute_and_plot_fft(dataframe_dicts[0]["KELP"])  # Example: compute FFT for the first dataframe
@@ -165,5 +165,5 @@ if __name__ == "__main__":
     window_size = int(0.5 * sampling_frequency/max_freq)
     print(f"Window size: {window_size}")
     # window_size = 10
-    plot_moving_average(dataframe_dicts[0]["KELP"], window_size=window_size)  # Example: plot moving average for the first dataframe
+    plot_moving_average(dataframe_dicts[0]["CROISSANTS"], window_size=window_size)  # Example: plot moving average for the first dataframe
     print(window_size)
