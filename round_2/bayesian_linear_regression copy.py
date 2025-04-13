@@ -106,7 +106,7 @@ def test_bayes_model(models, test_data):
         
         # Plot results (sorted by time index)
         plt.figure(figsize=(10, 6))
-        plt.plot(y_test_sorted.index, y_test_sorted.values, label="Actual Mid Price", marker='o', linestyle='-', color='b')
+        plt.plot(y_test_sorted.index, y_test_sorted.values, label="Actual Mid Price", linestyle='-', color='b')
         plt.plot(y_test_sorted.index, y_pred_sorted, label="Predicted Mid Price", linestyle='dashed', color='r')
         plt.fill_between(y_test_sorted.index, y_pred_sorted - std_dev, y_pred_sorted + std_dev, alpha=0.2, label="Prediction Std Dev")
         plt.title(f'{product} - Bayesian Linear Regression Prediction vs Actual on the TEST SET')
@@ -118,14 +118,14 @@ def test_bayes_model(models, test_data):
 
 if __name__ == "__main__":
     # Load CSV (you can modify the path accordingly)
-    training_data = pd.read_csv('sample_data/round-2-island-data-bottle/prices_round_2_day_-1.csv', delimiter=';')
+    training_data = pd.read_csv('sample_data/round-3-island-data-bottle/prices_round_3_day_0.csv', delimiter=';')
     # Fill NaN values with 0 for the entire dataset
     training_data = training_data.fillna(0)
 
     models = fit_bayes_model(training_data, plot=False)
 
     # Load CSV (you can modify the path accordingly)
-    test_data = pd.read_csv('sample_data/round-2-island-data-bottle/prices_round_2_day_0.csv', delimiter=';')
+    test_data = pd.read_csv('sample_data/round-3-island-data-bottle/prices_round_3_day_1.csv', delimiter=';')
     # Fill NaN values with 0 for the entire dataset
     test_data = test_data.fillna(0)
 
