@@ -17,7 +17,7 @@ from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
-        self.max_log_length = 3750
+        self.max_log_length = 3750 # Adjusted based on typical limits
 
     def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
         self.logs += sep.join(map(str, objects)) + end
@@ -25,40 +25,62 @@ class Logger:
     def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
         # This flush method is provided for context and remains unchanged.
         # It handles compressing the state and logs to fit within the output limits.
-        base_length = len(
-            self.to_json(
-                [
-                    self.compress_state(state, ""),
-                    self.compress_orders(orders),
-                    conversions,
-                    "",
-                    "",
-                ]
-            )
-        )
+        output = [
+            self.compress_state(state, trader_data),
+            self.compress_orders(orders),
+            conversions,
+        ]
+        output_json = self.to_json(output)
 
-        # We truncate state.traderData, trader_data, and self.logs to the same max. length to fit the log limit
-        max_item_length = (self.max_log_length - base_length) // 3
+        # Check if the output is too long
+        if len(output_json) > self.max_log_length:
+            # Calculate the base length without logs and trader data
+            base_output = [
+                self.compress_state(state, ""), # Empty trader data for length calculation
+                self.compress_orders(orders),
+                conversions,
+            ]
+            base_length = len(self.to_json(base_output))
+            # Add length for keys and structure "traderData": "", "logs": ""
+            base_length += 24 # Approximate length for keys and quotes
 
-        print(
-            self.to_json(
-                [
-                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
-                    self.compress_orders(orders),
-                    conversions,
-                    self.truncate(trader_data, max_item_length),
-                    self.truncate(self.logs, max_item_length),
-                ]
-            )
-        )
+            # Available length for trader_data and logs
+            available_length = self.max_log_length - base_length
+            max_item_length = available_length // 2 # Divide remaining space between trader_data and logs
 
-        self.logs = ""
+            if max_item_length < 0: max_item_length = 0 # Ensure non-negative length
+
+            # Truncate trader_data and logs
+            truncated_trader_data = self.truncate(trader_data, max_item_length)
+            truncated_logs = self.truncate(self.logs, max_item_length)
+
+            # Recompress state with truncated trader_data
+            final_output = [
+                self.compress_state(state, truncated_trader_data),
+                self.compress_orders(orders),
+                conversions,
+                truncated_logs, # Add truncated logs separately for final JSON
+            ]
+            print(self.to_json(final_output))
+
+        else:
+             # Original output fits, add logs to the end
+             final_output = [
+                self.compress_state(state, trader_data),
+                self.compress_orders(orders),
+                conversions,
+                self.logs, # Add logs here
+            ]
+             print(self.to_json(final_output))
+
+
+        self.logs = "" # Clear logs after flushing
 
     def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
         # Helper for flush - unchanged
         return [
             state.timestamp,
-            trader_data,
+            trader_data, # Use potentially truncated trader_data
             self.compress_listings(state.listings),
             self.compress_order_depths(state.order_depths),
             self.compress_trades(state.own_trades),
@@ -123,12 +145,17 @@ class Logger:
 
     def to_json(self, value: Any) -> str:
         # Helper for flush - unchanged
+        # Use dumps with ProsperityEncoder for custom objects if needed, ensure separators for compactness
         return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
 
     def truncate(self, value: str, max_length: int) -> str:
         # Helper for flush - unchanged
         if len(value) <= max_length:
             return value
+        # Ensure max_length is not too small for ellipsis
+        if max_length < 3:
+            return value[:max_length]
         return value[: max_length - 3] + "..."
 
 
@@ -151,29 +178,27 @@ class Trader:
 
         # Define the components of each basket
         self.basket_components = {
-            "PICNIC_BASKET1": {"CROISSANTS": 1, "JAMS": 1},
-            "PICNIC_BASKET2": {"RAINFOREST_RESIN": 1, "KELP": 1, "SQUID_INK": 1}
+            "PICNIC_BASKET1": {"CROISSANTS": 6, "JAMS": 3, "DJEMBES": 1},
+            "PICNIC_BASKET2": {"CROISSANTS": 4, "JAMS": 2}
         }
 
         # Track previous positions for logging changes
         self.previous_positions = {}
         # Store traderData if needed between runs
-        self.trader_data = ""
+        self.trader_data = "" # Can be used for more complex state tracking if needed
 
         # --- Strategy Parameters ---
-        # Minimum profit per basket for arbitrage trades
-        self.min_arbitrage_profit = 2.0 # Increased from 1.0
-        # Minimum spread for market making
-        self.mm_spread_threshold = 3 # Increased from > 1
-        # Base volume for market making orders
-        self.mm_base_volume = 4 # Reduced from 5
+        self.min_arbitrage_profit = 100.0 # Threshold for initiating NEW arbitrage
+        self.flattening_profit_threshold = 10.0 # Lower threshold for closing existing positions
+        self.mm_spread_threshold = 3
+        self.mm_base_volume = 10
 
-    # Helper function to check and update positions before adding order
+    # Helper function to check position limits before placing an order
     def _can_place_order(self, symbol: Symbol, quantity: int, current_pos: int, pending_pos_delta: Dict[Symbol, int]) -> bool:
         limit = self.position_limits.get(symbol)
         if limit is None:
             logger.print(f"Warning: No position limit found for {symbol}. Order rejected.")
-            return False # Should not happen if limits are defined for all traded symbols
+            return False
 
         pending_delta = pending_pos_delta.get(symbol, 0)
         final_pos = current_pos + pending_delta + quantity
@@ -184,236 +209,206 @@ class Trader:
             # logger.print(f"Order rejected for {symbol}: Quantity {quantity} would exceed limit {limit}. Current: {current_pos}, Pending Delta: {pending_delta}, Resulting: {final_pos}")
             return False
 
-    def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
-        """
-        Main trading logic
-        """
-        result = {symbol: [] for symbol in state.order_depths.keys()}
-        pending_pos_delta: Dict[Symbol, int] = {} # Tracks position changes within this timestep
+    # Helper to calculate component costs, values, and volume limits
+    def _calculate_component_prices_volumes(self, state: TradingState, components: Dict[str, int]) -> tuple[float, float, list[int], list[int], bool, bool]:
+        """Calculates cost to buy components, value to sell components, and volume limits per basket."""
+        component_cost = 0
+        component_ask_volumes_at_best = []
+        can_buy_components = True
+        for component, quantity in components.items():
+            if component not in state.order_depths:
+                can_buy_components = False
+                break
+            component_depth = state.order_depths[component]
+            if not component_depth.sell_orders:
+                can_buy_components = False
+                break
+            best_component_ask = min(component_depth.sell_orders.keys())
+            component_cost += best_component_ask * quantity
+            component_ask_volume = abs(component_depth.sell_orders.get(best_component_ask, 0))
+            if quantity > 0:
+                # Volume limit per basket for this component at best ask
+                component_ask_volumes_at_best.append(component_ask_volume // quantity)
+            else:
+                component_ask_volumes_at_best.append(float('inf'))
+        if not can_buy_components:
+            component_cost = float('inf')
 
-        # Log position changes from the previous state
-        if not self.previous_positions: # Initialize if first run
-            self.previous_positions = state.position.copy()
-        else: # Log changes on subsequent runs
-            self.log_position_changes(state.position, state.timestamp)
+        component_value = 0
+        component_bid_volumes_at_best = []
+        can_sell_components = True
+        for component, quantity in components.items():
+            # Need to re-check availability for selling
+            if component not in state.order_depths:
+                 can_sell_components = False
+                 break
+            component_depth = state.order_depths[component]
+            if not component_depth.buy_orders:
+                can_sell_components = False
+                break
+            best_component_bid = max(component_depth.buy_orders.keys())
+            component_value += best_component_bid * quantity
+            component_bid_volume = abs(component_depth.buy_orders.get(best_component_bid, 0))
+            if quantity > 0:
+                # Volume limit per basket for this component at best bid
+                component_bid_volumes_at_best.append(component_bid_volume // quantity)
+            else:
+                component_bid_volumes_at_best.append(float('inf'))
+        if not can_sell_components:
+            component_value = 0
 
+        return component_cost, component_value, component_ask_volumes_at_best, component_bid_volumes_at_best, can_buy_components, can_sell_components
 
-        # 1. Find potential arbitrage opportunities
-        potential_arbitrage_orders = self.find_arbitrage_opportunities(state)
-        arbitrage_symbols_traded = set() # Keep track of symbols involved in *executed* arbitrage
-
-        # Process potential arbitrage orders, checking limits for each leg
-        for basket, components in self.basket_components.items():
-            # Check Strategy 1 (Buy Basket, Sell Components) potential orders
-            strat1_orders = potential_arbitrage_orders.get(f"{basket}_strat1", [])
-            if strat1_orders:
-                basket_order = strat1_orders[0]
-                component_orders = strat1_orders[1:]
-                can_place_all_legs = True
-
-                # Check basket leg
-                if not self._can_place_order(basket_order.symbol, basket_order.quantity, state.position.get(basket, 0), pending_pos_delta):
-                    can_place_all_legs = False
-
-                # Check component legs
-                if can_place_all_legs:
-                    for comp_order in component_orders:
-                        if not self._can_place_order(comp_order.symbol, comp_order.quantity, state.position.get(comp_order.symbol, 0), pending_pos_delta):
-                            can_place_all_legs = False
-                            break
-
-                # If all legs are possible, add them and update pending positions
-                if can_place_all_legs:
-                    logger.print(f"Executing Arbitrage (Strat 1) for {basket}: {strat1_orders}")
-                    for order in strat1_orders:
-                        result[order.symbol].append(order)
-                        pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
-                        arbitrage_symbols_traded.add(order.symbol)
-                    arbitrage_symbols_traded.add(basket) # Ensure basket is marked
-
-            # Check Strategy 2 (Sell Basket, Buy Components) potential orders
-            strat2_orders = potential_arbitrage_orders.get(f"{basket}_strat2", [])
-            if strat2_orders:
-                basket_order = strat2_orders[0]
-                component_orders = strat2_orders[1:]
-                can_place_all_legs = True
-
-                # Check basket leg
-                if not self._can_place_order(basket_order.symbol, basket_order.quantity, state.position.get(basket, 0), pending_pos_delta):
-                    can_place_all_legs = False
-
-                # Check component legs
-                if can_place_all_legs:
-                    for comp_order in component_orders:
-                        if not self._can_place_order(comp_order.symbol, comp_order.quantity, state.position.get(comp_order.symbol, 0), pending_pos_delta):
-                            can_place_all_legs = False
-                            break
-
-                # If all legs are possible, add them and update pending positions
-                if can_place_all_legs:
-                    logger.print(f"Executing Arbitrage (Strat 2) for {basket}: {strat2_orders}")
-                    for order in strat2_orders:
-                        result[order.symbol].append(order)
-                        pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
-                        arbitrage_symbols_traded.add(order.symbol)
-                    arbitrage_symbols_traded.add(basket) # Ensure basket is marked
-
-
-        # 2. Add market making orders ONLY for symbols NOT involved in executed arbitrage this tick
-        for symbol in state.order_depths:
-            if symbol not in arbitrage_symbols_traded:
-                # Use the current position + any delta from executed arbitrage trades
-                effective_position = state.position.get(symbol, 0) + pending_pos_delta.get(symbol, 0)
-                potential_mm_orders = self.get_market_making_orders(symbol, state.order_depths[symbol], effective_position)
-
-                for order in potential_mm_orders:
-                    # Check limit again before adding MM order
-                    if self._can_place_order(order.symbol, order.quantity, state.position.get(symbol, 0), pending_pos_delta):
-                        result[order.symbol].append(order)
-                        pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
-                    # else:
-                        # logger.print(f"MM Order skipped for {symbol} due to limit.")
-
-
-        # Determine number of conversions (0 for now)
-        conversions = 0
-
-        # Log final orders placed
-        orders_to_log = {symbol: orders for symbol, orders in result.items() if orders}
-        if orders_to_log:
-             logger.print(f"Timestamp: {state.timestamp}, Final Orders: {orders_to_log}")
-             # logger.print(f"Timestamp: {state.timestamp}, Pending Deltas: {pending_pos_delta}") # Can be noisy
-        # else: # Reduce logging noise
-             # logger.print(f"Timestamp: {state.timestamp}, No orders placed.")
-
-
-        # Update trader data if necessary
-        # self.trader_data = "..." # Example: Storing some state
-
-        # Update previous positions AFTER all logic for the current timestamp is done
-        self.previous_positions = state.position.copy()
-
-        # Flush the logs, orders, conversions, and trader data to standard output
-        logger.flush(state, result, conversions, self.trader_data)
-
-        # Return the orders, conversions, and trader data
-        return result, conversions, self.trader_data
-
-    def log_position_changes(self, current_positions: dict[Symbol, int], timestamp: int) -> None:
-        """
-        Log changes in positions compared to the start of the previous run.
-        """
-        log_entry = []
-        all_symbols = set(current_positions.keys()) | set(self.previous_positions.keys())
-        for symbol in sorted(list(all_symbols)):
-            prev_pos = self.previous_positions.get(symbol, 0)
-            curr_pos = current_positions.get(symbol, 0)
-            if prev_pos != curr_pos:
-                log_entry.append(f"{symbol}: {prev_pos} -> {curr_pos}")
-
-        if log_entry: # Only log if there were changes
-            logger.print(f"Position Changes @ {timestamp}: {', '.join(log_entry)}")
-
-
-    def find_arbitrage_opportunities(self, state: TradingState) -> dict[str, list[Order]]:
-        """
-        Find potential arbitrage opportunities. Returns a dictionary where keys
-        are like 'BASKET_strat1' or 'BASKET_strat2' and values are lists of
-        potential orders for that strategy leg. Uses self.min_arbitrage_profit.
-        """
-        potential_orders = {} # Use unique keys for each potential strategy execution
+    # Find opportunities to flatten existing arbitrage positions
+    def find_flattening_opportunities(self, state: TradingState) -> dict[str, list[Order]]:
+        """Checks existing positions and generates closing orders if opposite arbitrage is profitable."""
+        flattening_orders = {}
 
         for basket, components in self.basket_components.items():
-            if basket not in state.order_depths:
-                continue
+            if basket not in state.order_depths: continue
+            all_components_available = all(comp in state.order_depths for comp in components)
+            if not all_components_available: continue
 
-            all_components_available = True
-            for component in components:
-                if component not in state.order_depths:
-                    all_components_available = False
-                    break
-            if not all_components_available:
-                continue
+            current_pos_basket = state.position.get(basket, 0)
+            # Simplification: Assume position direction indicates potential arb position
+            # A more robust check would verify component ratios, but adds complexity
+            potential_strat1_pos = current_pos_basket > 0 # Potentially long basket, short components
+            potential_strat2_pos = current_pos_basket < 0 # Potentially short basket, long components
+
+            if not potential_strat1_pos and not potential_strat2_pos:
+                continue # No basket position, likely no arb position to flatten
 
             basket_depth = state.order_depths[basket]
             best_basket_bid = max(basket_depth.buy_orders.keys()) if basket_depth.buy_orders else 0
             best_basket_ask = min(basket_depth.sell_orders.keys()) if basket_depth.sell_orders else float('inf')
 
-            # --- Calculate cost to BUY components (using best asks) ---
-            component_cost = 0
-            component_ask_volumes_at_best = []
-            can_buy_components = True
-            for component, quantity in components.items():
-                component_depth = state.order_depths[component]
-                if not component_depth.sell_orders:
-                    can_buy_components = False
-                    break
-                best_component_ask = min(component_depth.sell_orders.keys())
-                component_cost += best_component_ask * quantity
-                component_ask_volume = abs(component_depth.sell_orders.get(best_component_ask, 0))
-                if quantity > 0:
-                    # Calculate how many *baskets* worth of this component we could buy at best ask
-                    component_ask_volumes_at_best.append(component_ask_volume // quantity)
-                else: # Should not happen for these baskets, but good practice
-                    component_ask_volumes_at_best.append(float('inf'))
+            component_cost, component_value, comp_ask_vols, comp_bid_vols, can_buy_comps, can_sell_comps = self._calculate_component_prices_volumes(state, components)
 
-            if not can_buy_components:
-                component_cost = float('inf')
+            # --- Check if we have a Strat 1 position and Strat 2 (closing) is profitable ---
+            if potential_strat1_pos:
+                closing_profit_margin = best_basket_bid - component_cost # Profit from selling basket, buying components
+                if can_buy_comps and best_basket_bid != 0 and closing_profit_margin >= self.flattening_profit_threshold:
+                    max_flatten_size = current_pos_basket # Try to close the whole position
 
-            # --- Calculate value to SELL components (using best bids) ---
-            component_value = 0
-            component_bid_volumes_at_best = []
-            can_sell_components = True
-            for component, quantity in components.items():
-                component_depth = state.order_depths[component]
-                if not component_depth.buy_orders:
-                    can_sell_components = False
-                    break
-                best_component_bid = max(component_depth.buy_orders.keys())
-                component_value += best_component_bid * quantity
-                component_bid_volume = abs(component_depth.buy_orders.get(best_component_bid, 0))
-                if quantity > 0:
-                     # Calculate how many *baskets* worth of this component we could sell at best bid
-                    component_bid_volumes_at_best.append(component_bid_volume // quantity)
-                else:
-                    component_bid_volumes_at_best.append(float('inf'))
+                    basket_bid_volume = abs(basket_depth.buy_orders.get(best_basket_bid, 0))
+                    max_component_buy_based_on_volume = min(comp_ask_vols) if comp_ask_vols else 0
+                    limit_basket = self.position_limits[basket]
+                    # Capacity to sell basket (current_pos is positive)
+                    position_limit_sell_basket = limit_basket + current_pos_basket
 
-            if not can_sell_components:
-                component_value = 0
+                    component_buy_limits_allow = []
+                    for component, quantity in components.items():
+                         if quantity > 0:
+                            comp_pos = state.position.get(component, 0) # Likely negative
+                            comp_limit = self.position_limits[component]
+                            max_can_buy_comp = comp_limit - comp_pos # Capacity to buy (towards positive limit)
+                            max_baskets_allowed = max_can_buy_comp // quantity if quantity > 0 else float('inf')
+                            component_buy_limits_allow.append(max_baskets_allowed)
+                         else: component_buy_limits_allow.append(float('inf'))
+                    max_baskets_comp_limits_buy = min(component_buy_limits_allow) if component_buy_limits_allow else 0
 
+                    actual_trade_size = min(
+                        max_flatten_size,
+                        max(0, basket_bid_volume),
+                        max(0, position_limit_sell_basket),
+                        max(0, max_component_buy_based_on_volume),
+                        max(0, max_baskets_comp_limits_buy)
+                    )
+
+                    if actual_trade_size > 0:
+                        strat_key = f"{basket}_flatten_strat1"
+                        flattening_orders[strat_key] = []
+                        flattening_orders[strat_key].append(Order(basket, best_basket_bid, -actual_trade_size))
+                        for component, quantity in components.items():
+                            comp_depth = state.order_depths[component]
+                            best_comp_ask = min(comp_depth.sell_orders.keys())
+                            flattening_orders[strat_key].append(Order(component, best_comp_ask, actual_trade_size * quantity))
+                        # logger.print(f"Potential Flattening (Strat 1 -> 2): Sell {actual_trade_size} {basket}@{best_basket_bid}. Profit/Unit: {closing_profit_margin}")
+
+
+            # --- Check if we have a Strat 2 position and Strat 1 (closing) is profitable ---
+            elif potential_strat2_pos:
+                closing_profit_margin = component_value - best_basket_ask # Profit from selling components, buying basket
+                if can_sell_comps and best_basket_ask != float('inf') and closing_profit_margin >= self.flattening_profit_threshold:
+                    max_flatten_size = abs(current_pos_basket) # Try to close the whole position
+
+                    basket_ask_volume = abs(basket_depth.sell_orders.get(best_basket_ask, 0))
+                    max_component_sell_based_on_volume = min(comp_bid_vols) if comp_bid_vols else 0
+                    limit_basket = self.position_limits[basket]
+                    # Capacity to buy basket (current_pos is negative)
+                    position_limit_buy_basket = limit_basket - current_pos_basket
+
+                    component_sell_limits_allow = []
+                    for component, quantity in components.items():
+                        if quantity > 0:
+                            comp_pos = state.position.get(component, 0) # Likely positive
+                            comp_limit = self.position_limits[component]
+                            max_can_sell_comp = comp_pos + comp_limit # Capacity to sell (towards negative limit)
+                            max_baskets_allowed = max_can_sell_comp // quantity if quantity > 0 else float('inf')
+                            component_sell_limits_allow.append(max_baskets_allowed)
+                        else: component_sell_limits_allow.append(float('inf'))
+                    max_baskets_comp_limits_sell = min(component_sell_limits_allow) if component_sell_limits_allow else 0
+
+                    actual_trade_size = min(
+                        max_flatten_size,
+                        max(0, basket_ask_volume),
+                        max(0, position_limit_buy_basket),
+                        max(0, max_component_sell_based_on_volume),
+                        max(0, max_baskets_comp_limits_sell)
+                    )
+
+                    if actual_trade_size > 0:
+                        strat_key = f"{basket}_flatten_strat2"
+                        flattening_orders[strat_key] = []
+                        flattening_orders[strat_key].append(Order(basket, best_basket_ask, actual_trade_size))
+                        for component, quantity in components.items():
+                            comp_depth = state.order_depths[component]
+                            best_comp_bid = max(comp_depth.buy_orders.keys())
+                            flattening_orders[strat_key].append(Order(component, best_comp_bid, -actual_trade_size * quantity))
+                        # logger.print(f"Potential Flattening (Strat 2 -> 1): Buy {actual_trade_size} {basket}@{best_basket_ask}. Profit/Unit: {closing_profit_margin}")
+
+        return flattening_orders
+
+    # Find NEW arbitrage opportunities
+    def find_arbitrage_opportunities(self, state: TradingState) -> dict[str, list[Order]]:
+        """Find potential NEW arbitrage opportunities. Uses self.min_arbitrage_profit."""
+        potential_orders = {}
+        for basket, components in self.basket_components.items():
+            if basket not in state.order_depths: continue
+            all_components_available = all(comp in state.order_depths for comp in components)
+            if not all_components_available: continue
+
+            basket_depth = state.order_depths[basket]
+            best_basket_bid = max(basket_depth.buy_orders.keys()) if basket_depth.buy_orders else 0
+            best_basket_ask = min(basket_depth.sell_orders.keys()) if basket_depth.sell_orders else float('inf')
+
+            component_cost, component_value, comp_ask_vols, comp_bid_vols, can_buy_comps, can_sell_comps = self._calculate_component_prices_volumes(state, components)
 
             # --- Strategy 1: Buy basket, sell components ---
             profit_margin_1 = component_value - best_basket_ask
-            # Use the minimum profit threshold
-            if profit_margin_1 >= self.min_arbitrage_profit and component_value > 0 and best_basket_ask != float('inf'):
+            if can_sell_comps and best_basket_ask != float('inf') and profit_margin_1 >= self.min_arbitrage_profit:
                 basket_ask_volume = abs(basket_depth.sell_orders.get(best_basket_ask, 0))
                 current_pos_basket = state.position.get(basket, 0)
                 limit_basket = self.position_limits[basket]
-                # Max baskets we can buy based on basket position limit
                 position_limit_buy_basket = limit_basket - current_pos_basket
-                # Max baskets we can make based on component sell volume available at best bid
-                max_component_sell_based_on_volume = min(component_bid_volumes_at_best) if component_bid_volumes_at_best else 0
+                max_component_sell_based_on_volume = min(comp_bid_vols) if comp_bid_vols else 0
 
-                # Max baskets we can make based on component position limits (ability to sell)
                 component_sell_limits_allow = []
                 for component, quantity in components.items():
                     if quantity > 0:
                         comp_pos = state.position.get(component, 0)
                         comp_limit = self.position_limits[component]
-                        # Max we can sell = current position + limit (e.g., pos 10, limit 50 -> can sell 60 -> pos -50)
                         max_can_sell_comp = comp_pos + comp_limit
-                        # How many baskets does this allow?
                         max_baskets_allowed = max_can_sell_comp // quantity if quantity > 0 else float('inf')
                         component_sell_limits_allow.append(max_baskets_allowed)
-                    else:
-                        component_sell_limits_allow.append(float('inf'))
+                    else: component_sell_limits_allow.append(float('inf'))
                 max_baskets_comp_limits_sell = min(component_sell_limits_allow) if component_sell_limits_allow else 0
 
                 max_trade_size = min(
-                    max(0, basket_ask_volume),             # Limit by basket ask volume
-                    max(0, position_limit_buy_basket),     # Limit by basket buy position capacity
-                    max(0, max_component_sell_based_on_volume), # Limit by component bid volume
-                    max(0, max_baskets_comp_limits_sell)   # Limit by component sell position capacity
+                    max(0, basket_ask_volume),
+                    max(0, position_limit_buy_basket),
+                    max(0, max_component_sell_based_on_volume),
+                    max(0, max_baskets_comp_limits_sell)
                 )
 
                 if max_trade_size > 0:
@@ -422,44 +417,36 @@ class Trader:
                     potential_orders[strat_key].append(Order(basket, best_basket_ask, max_trade_size))
                     for component, quantity in components.items():
                         component_depth = state.order_depths[component]
-                        best_component_bid = max(component_depth.buy_orders.keys()) # Price to sell component
-                        component_sell_volume = -max_trade_size * quantity
-                        potential_orders[strat_key].append(Order(component, best_component_bid, component_sell_volume))
-                    # logger.print(f"Potential Arbitrage (Strat 1): Buy {max_trade_size} {basket}@{best_basket_ask}, Sell Components (Value: {component_value}). Profit/Unit: {profit_margin_1}")
+                        best_component_bid = max(component_depth.buy_orders.keys())
+                        potential_orders[strat_key].append(Order(component, best_component_bid, -max_trade_size * quantity))
+                    # logger.print(f"Potential Arbitrage (Strat 1): Buy {max_trade_size} {basket}@{best_basket_ask}. Profit/Unit: {profit_margin_1}")
 
 
             # --- Strategy 2: Buy components, sell basket ---
             profit_margin_2 = best_basket_bid - component_cost
-            # Use the minimum profit threshold
-            if profit_margin_2 >= self.min_arbitrage_profit and component_cost != float('inf') and best_basket_bid != 0:
+            if can_buy_comps and best_basket_bid != 0 and profit_margin_2 >= self.min_arbitrage_profit:
                 basket_bid_volume = abs(basket_depth.buy_orders.get(best_basket_bid, 0))
                 current_pos_basket = state.position.get(basket, 0)
                 limit_basket = self.position_limits[basket]
-                # Max baskets we can sell based on basket position limit
                 position_limit_sell_basket = limit_basket + current_pos_basket
-                # Max baskets we can make based on component ask volume available at best ask
-                max_component_buy_based_on_volume = min(component_ask_volumes_at_best) if component_ask_volumes_at_best else 0
+                max_component_buy_based_on_volume = min(comp_ask_vols) if comp_ask_vols else 0
 
-                # Max baskets we can make based on component position limits (ability to buy)
                 component_buy_limits_allow = []
                 for component, quantity in components.items():
                     if quantity > 0:
                         comp_pos = state.position.get(component, 0)
                         comp_limit = self.position_limits[component]
-                        # Max we can buy = limit - current position (e.g., pos 10, limit 50 -> can buy 40 -> pos 50)
                         max_can_buy_comp = comp_limit - comp_pos
-                        # How many baskets does this allow?
                         max_baskets_allowed = max_can_buy_comp // quantity if quantity > 0 else float('inf')
                         component_buy_limits_allow.append(max_baskets_allowed)
-                    else:
-                        component_buy_limits_allow.append(float('inf'))
+                    else: component_buy_limits_allow.append(float('inf'))
                 max_baskets_comp_limits_buy = min(component_buy_limits_allow) if component_buy_limits_allow else 0
 
                 max_trade_size = min(
-                    max(0, basket_bid_volume),              # Limit by basket bid volume
-                    max(0, position_limit_sell_basket),     # Limit by basket sell position capacity
-                    max(0, max_component_buy_based_on_volume), # Limit by component ask volume
-                    max(0, max_baskets_comp_limits_buy)    # Limit by component buy position capacity
+                    max(0, basket_bid_volume),
+                    max(0, position_limit_sell_basket),
+                    max(0, max_component_buy_based_on_volume),
+                    max(0, max_baskets_comp_limits_buy)
                 )
 
                 if max_trade_size > 0:
@@ -468,13 +455,13 @@ class Trader:
                     potential_orders[strat_key].append(Order(basket, best_basket_bid, -max_trade_size))
                     for component, quantity in components.items():
                         component_depth = state.order_depths[component]
-                        best_component_ask = min(component_depth.sell_orders.keys()) # Price to buy component
-                        component_buy_volume = max_trade_size * quantity
-                        potential_orders[strat_key].append(Order(component, best_component_ask, component_buy_volume))
-                    # logger.print(f"Potential Arbitrage (Strat 2): Sell {max_trade_size} {basket}@{best_basket_bid}, Buy Components (Cost: {component_cost}). Profit/Unit: {profit_margin_2}")
+                        best_component_ask = min(component_depth.sell_orders.keys())
+                        potential_orders[strat_key].append(Order(component, best_component_ask, max_trade_size * quantity))
+                    # logger.print(f"Potential Arbitrage (Strat 2): Sell {max_trade_size} {basket}@{best_basket_bid}. Profit/Unit: {profit_margin_2}")
 
         return potential_orders
 
+    # Standard market making logic (with inventory skewing)
     def get_market_making_orders(self, symbol: Symbol, depth: OrderDepth, position: int) -> list[Order]:
         """
         Get market making orders for a single symbol, respecting position limits
@@ -507,47 +494,209 @@ class Trader:
             # Default: Place 1 tick inside spread
             buy_price = best_bid_price + 1
             sell_price = best_ask_price - 1
+            buy_volume = base_volume
+            sell_volume = base_volume
 
-            # If significantly long, make buy quote passive, sell quote aggressive
-            if position > base_volume / 2: # Example threshold: long more than half base volume
+            # If significantly long, make buy quote passive, sell quote aggressive, adjust volume
+            if position > base_volume / 2:
                 buy_price = best_bid_price # Quote at best bid (passive)
                 # sell_price remains best_ask - 1 (aggressive)
-                # logger.print(f"MM Skew LONG for {symbol}: Buy@Bid, Sell@Ask-1")
+                buy_volume = max(0, base_volume - position // 2) # Reduce buy volume
+                # logger.print(f"MM Skew LONG for {symbol}: Buy@Bid({buy_volume}), Sell@Ask-1({sell_volume})")
 
-            # If significantly short, make sell quote passive, buy quote aggressive
-            elif position < -base_volume / 2: # Example threshold: short more than half base volume
+            # If significantly short, make sell quote passive, buy quote aggressive, adjust volume
+            elif position < -base_volume / 2:
                 sell_price = best_ask_price # Quote at best ask (passive)
                 # buy_price remains best_bid + 1 (aggressive)
-                # logger.print(f"MM Skew SHORT for {symbol}: Buy@Bid+1, Sell@Ask")
+                sell_volume = max(0, base_volume - abs(position) // 2) # Reduce sell volume
+                # logger.print(f"MM Skew SHORT for {symbol}: Buy@Bid+1({buy_volume}), Sell@Ask({sell_volume})")
 
-            # else: # Near flat, quote aggressively on both sides
-                # logger.print(f"MM Skew FLAT for {symbol}: Buy@Bid+1, Sell@Ask-1")
+            # else: # Near flat, quote aggressively on both sides with base volume
+                # logger.print(f"MM Skew FLAT for {symbol}: Buy@Bid+1({buy_volume}), Sell@Ask-1({sell_volume})")
 
 
             # --- Place Orders ---
             # Place Buy Order
-            if buy_capacity > 0:
-                # Volume is minimum of base and capacity
-                buy_volume = min(base_volume, buy_capacity)
-                if buy_volume > 0:
-                    # Ensure our buy price is still below the best ask
-                    if buy_price < best_ask_price:
-                        orders.append(Order(symbol, buy_price, buy_volume))
-                        # logger.print(f"Potential MM Buy Order: {buy_volume} {symbol}@{buy_price}")
-                    # else:
-                        # logger.print(f"MM Buy price {buy_price} crossed ask {best_ask_price} for {symbol}, skipped.")
+            final_buy_volume = min(buy_volume, buy_capacity)
+            if final_buy_volume > 0:
+                # Ensure our buy price is still below the best ask
+                if buy_price < best_ask_price:
+                    orders.append(Order(symbol, buy_price, final_buy_volume))
+                    # logger.print(f"Potential MM Buy Order: {final_buy_volume} {symbol}@{buy_price}")
+                # else:
+                    # logger.print(f"MM Buy price {buy_price} crossed ask {best_ask_price} for {symbol}, skipped.")
 
 
             # Place Sell Order
-            if sell_capacity > 0:
-                # Volume is minimum of base and capacity
-                sell_volume = min(base_volume, sell_capacity)
-                if sell_volume > 0:
-                     # Ensure our sell price is still above the best bid
-                    if sell_price > best_bid_price:
-                        orders.append(Order(symbol, sell_price, -sell_volume)) # Negative volume for sell
-                        # logger.print(f"Potential MM Sell Order: {-sell_volume} {symbol}@{sell_price}")
-                    # else:
-                        # logger.print(f"MM Sell price {sell_price} crossed bid {best_bid_price} for {symbol}, skipped.")
+            final_sell_volume = min(sell_volume, sell_capacity)
+            if final_sell_volume > 0:
+                 # Ensure our sell price is still above the best bid
+                if sell_price > best_bid_price:
+                    orders.append(Order(symbol, sell_price, -final_sell_volume)) # Negative volume for sell
+                    # logger.print(f"Potential MM Sell Order: {-final_sell_volume} {symbol}@{sell_price}")
+                # else:
+                    # logger.print(f"MM Sell price {sell_price} crossed bid {best_bid_price} for {symbol}, skipped.")
 
-        return orders
+        return orders # Corrected typo here
+
+
+    def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
+        """
+        Main trading logic: Flatten -> Arbitrage -> Market Make
+        """
+        result = {symbol: [] for symbol in state.order_depths.keys()}
+        pending_pos_delta: Dict[Symbol, int] = {} # Tracks position changes *within* this timestep
+        traded_symbols_this_tick = set() # Symbols involved in *any* executed arbitrage or flattening trade
+
+        # Log position changes from the previous state
+        if not self.previous_positions: # Initialize if first run
+            self.previous_positions = state.position.copy()
+        else: # Log changes on subsequent runs
+            self.log_position_changes(state.position, state.timestamp)
+
+        # --- 0. Check for Flattening Opportunities FIRST ---
+        potential_flattening_orders = self.find_flattening_opportunities(state)
+        executed_flattening_baskets = set()
+
+        for strat_key, orders_to_flatten in potential_flattening_orders.items():
+            if not orders_to_flatten: continue
+            basket_order = orders_to_flatten[0]
+            component_orders = orders_to_flatten[1:]
+            basket_symbol = basket_order.symbol
+            can_place_all_legs = True
+
+            # Check basket leg limit
+            if not self._can_place_order(basket_symbol, basket_order.quantity, state.position.get(basket_symbol, 0), pending_pos_delta):
+                can_place_all_legs = False
+
+            # Check component legs limits
+            if can_place_all_legs:
+                for comp_order in component_orders:
+                    if not self._can_place_order(comp_order.symbol, comp_order.quantity, state.position.get(comp_order.symbol, 0), pending_pos_delta):
+                        can_place_all_legs = False
+                        break
+
+            # If all legs possible, execute flattening trade
+            if can_place_all_legs:
+                logger.print(f"Executing Flattening Trade ({strat_key}): {orders_to_flatten}")
+                executed_flattening_baskets.add(basket_symbol)
+                for order in orders_to_flatten:
+                    result[order.symbol].append(order)
+                    pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
+                    traded_symbols_this_tick.add(order.symbol) # Mark symbol as traded
+
+        # --- 1. Find NEW Arbitrage Opportunities ---
+        potential_arbitrage_orders = self.find_arbitrage_opportunities(state)
+
+        # Process potential NEW arbitrage orders, checking limits and avoiding conflicts with flattening
+        for basket, components in self.basket_components.items():
+            # Skip if this basket was involved in flattening this tick
+            if basket in executed_flattening_baskets:
+                # logger.print(f"Skipping new arbitrage for {basket} due to flattening trade.")
+                continue
+
+            # Check Strategy 1 (Buy Basket, Sell Components)
+            strat1_key = f"{basket}_strat1"
+            strat1_orders = potential_arbitrage_orders.get(strat1_key, [])
+            if strat1_orders:
+                basket_order = strat1_orders[0]
+                component_orders = strat1_orders[1:]
+                can_place_all_legs = True
+                if not self._can_place_order(basket_order.symbol, basket_order.quantity, state.position.get(basket, 0), pending_pos_delta): can_place_all_legs = False
+                if can_place_all_legs:
+                    for comp_order in component_orders:
+                        if not self._can_place_order(comp_order.symbol, comp_order.quantity, state.position.get(comp_order.symbol, 0), pending_pos_delta):
+                            can_place_all_legs = False; break
+                if can_place_all_legs:
+                    logger.print(f"Executing Arbitrage (Strat 1) for {basket}: {strat1_orders}")
+                    for order in strat1_orders:
+                        result[order.symbol].append(order)
+                        pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
+                        traded_symbols_this_tick.add(order.symbol)
+
+            # Check Strategy 2 (Sell Basket, Buy Components)
+            strat2_key = f"{basket}_strat2"
+            strat2_orders = potential_arbitrage_orders.get(strat2_key, [])
+            if strat2_orders:
+                basket_order = strat2_orders[0]
+                component_orders = strat2_orders[1:]
+                can_place_all_legs = True
+                if not self._can_place_order(basket_order.symbol, basket_order.quantity, state.position.get(basket, 0), pending_pos_delta): can_place_all_legs = False
+                if can_place_all_legs:
+                    for comp_order in component_orders:
+                        if not self._can_place_order(comp_order.symbol, comp_order.quantity, state.position.get(comp_order.symbol, 0), pending_pos_delta):
+                            can_place_all_legs = False; break
+                if can_place_all_legs:
+                    logger.print(f"Executing Arbitrage (Strat 2) for {basket}: {strat2_orders}")
+                    for order in strat2_orders:
+                        result[order.symbol].append(order)
+                        pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
+                        traded_symbols_this_tick.add(order.symbol)
+
+
+        # --- 2. Market Making ---
+        # Skip MM for components always involved in arbs, SQUID_INK, and anything touched by arb/flattening THIS tick
+        # Also skip baskets themselves if they were traded.
+        symbols_to_skip_mm = traded_symbols_this_tick | {"SQUID_INK", "CROISSANTS", "JAMS", "DJEMBES"}
+        # Add baskets explicitly if they were traded
+        if "PICNIC_BASKET1" in traded_symbols_this_tick: symbols_to_skip_mm.add("PICNIC_BASKET1")
+        if "PICNIC_BASKET2" in traded_symbols_this_tick: symbols_to_skip_mm.add("PICNIC_BASKET2")
+
+
+        for symbol in state.order_depths:
+            if symbol in symbols_to_skip_mm:
+                # logger.print(f"Skipping MM for {symbol} (Arbitrage/Flattening or Explicit Skip)")
+                continue
+
+            # Use the current position + any delta from executed arbitrage/flattening trades
+            effective_position = state.position.get(symbol, 0) + pending_pos_delta.get(symbol, 0)
+            potential_mm_orders = self.get_market_making_orders(symbol, state.order_depths[symbol], effective_position)
+
+            for order in potential_mm_orders:
+                # Check limit again before adding MM order, using the *original* state position
+                # but considering the cumulative pending delta
+                if self._can_place_order(order.symbol, order.quantity, state.position.get(symbol, 0), pending_pos_delta):
+                    result[order.symbol].append(order)
+                    pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
+                # else:
+                     # logger.print(f"MM Order skipped for {symbol} due to limit.")
+
+
+        # --- Final Steps ---
+        conversions = 0 # No conversions logic implemented yet
+
+        # Log final orders placed
+        orders_to_log = {symbol: orders for symbol, orders in result.items() if orders}
+        if orders_to_log:
+             logger.print(f"Timestamp: {state.timestamp}, Final Orders: {orders_to_log}")
+             # logger.print(f"Timestamp: {state.timestamp}, Pending Deltas: {pending_pos_delta}") # Can be noisy
+        # else: # Reduce logging noise
+             # logger.print(f"Timestamp: {state.timestamp}, No orders placed.")
+
+
+        # Update trader data if necessary (not used in this version)
+        # self.trader_data = "..."
+
+        # Update previous positions AFTER all logic for the current timestamp is done
+        self.previous_positions = state.position.copy()
+
+        # Flush the logs, orders, conversions, and trader data to standard output
+        logger.flush(state, result, conversions, self.trader_data)
+
+        # Return the orders, conversions, and trader data
+        return result, conversions, self.trader_data
+
+    def log_position_changes(self, current_positions: dict[Symbol, int], timestamp: int) -> None:
+        """
+        Log changes in positions compared to the start of the previous run.
+        """
+        log_entry = []
+        all_symbols = set(current_positions.keys()) | set(self.previous_positions.keys())
+        for symbol in sorted(list(all_symbols)):
+            prev_pos = self.previous_positions.get(symbol, 0)
+            curr_pos = current_positions.get(symbol, 0)
+            if prev_pos != curr_pos:
+                log_entry.append(f"{symbol}: {prev_pos}->{curr_pos}") # Shortened format
+
+        if log_entry: # Only log if there were changes
+            logger.print(f"Pos Changes @ {timestamp}: {', '.join(log_entry)}")
