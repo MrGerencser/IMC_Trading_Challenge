@@ -10,7 +10,11 @@ data = pd.read_csv('sample_data/round-2-island-data-bottle/prices_round_2_day_-1
 # Fill NaN values with 0 for the entire dataset
 data = data.fillna(0)
 
-# Separate products
+def train_bayesian_linear_regression(data):
+    """
+    data: DataFrame containing the dataset
+    """
+    # Separate products
 products = data['product'].unique()
 
 # Plot results for each product
@@ -44,7 +48,7 @@ for product in products:
     # Calculate mean squared error and standard deviation
     mse = mean_squared_error(y_test, y_pred)
     std_dev = np.std(y_pred - y_test)
-    
+
     # Ensure that y_test.index is sorted in ascending order for correct plotting
     sorted_index = np.argsort(y_test.index)
     y_test_sorted = y_test.iloc[sorted_index]
@@ -61,6 +65,10 @@ for product in products:
     plt.legend()
     plt.show()
     
-    # Print model performance metrics
-    print(f"Mean Squared Error for {product}: {mse}")
-    print(f"Standard Deviation of Prediction Errors for {product}: {std_dev}")
+    # Extract and print the regression parameters (coefficients and intercept)
+    print(f"\nParameters for {product}:")
+    print("Intercept:", model.intercept_)
+    print("Coefficients (weights for features):")
+    for feature, coef in zip(features, model.coef_):
+        print(f"{feature}: {coef}")
+
