@@ -179,8 +179,14 @@ class Trader:
         # Removed Stat Arb Strategy Parameters
 
         # --- MM Strategy Parameters ---
-        self.mm_spread_threshold = 3
-        self.mm_base_volume = 10 # Base volume for RAINFOREST_RESIN MM
+        # RAINFOREST_RESIN parameters
+        self.mm_spread_threshold_resin = 7
+        self.mm_base_volume_resin = 30
+
+        # KELP parameters - Adjust these based on observation/backtesting
+        self.mm_spread_threshold_kelp = 4 # Require a wider spread for KELP initially
+        self.mm_base_volume_kelp = 50     # Maybe start with slightly lower volume for KELP
+
 
     # Removed _deserialize_trader_data as no complex state is needed
     # Removed _serialize_trader_data as no complex state is needed
@@ -205,11 +211,11 @@ class Trader:
     # Removed _calculate_rolling_stats as it's related to Stat Arb
 
     # Standard market making logic (with inventory skewing) - Kept as it's the core strategy now
-    def get_market_making_orders(self, symbol: Symbol, depth: OrderDepth, position: int) -> list[Order]:
+    def get_market_making_orders(self, symbol: Symbol, depth: OrderDepth, position: int, spread_threshold: int, base_volume: int) -> list[Order]:
         """
         Get market making orders for a single symbol, respecting position limits
         and skewing quotes based on inventory.
-        Uses self.mm_spread_threshold and self.mm_base_volume.
+        Uses passed spread_threshold and base_volume.
         """
         orders = []
         position_limit = self.position_limits.get(symbol)
@@ -228,36 +234,27 @@ class Trader:
         buy_capacity = position_limit - position
         sell_capacity = position_limit + position # Capacity to sell (towards negative limit)
 
-        # Define base volume
-        base_volume = self.mm_base_volume
-
         # Place orders only if spread is wide enough and we have capacity
         spread = best_ask_price - best_bid_price
-        if spread >= self.mm_spread_threshold:
+        if spread >= spread_threshold: # Use the passed threshold
             # --- Inventory Skewing ---
             # Default: Place 1 tick inside spread
             buy_price = best_bid_price + 1
             sell_price = best_ask_price - 1
+            # Use the passed base_volume
             buy_volume = base_volume
             sell_volume = base_volume
 
             # If significantly long, make buy quote passive, sell quote aggressive, adjust volume
+            # Skewing logic remains the same, but uses the passed base_volume for comparison
             if position > base_volume / 2:
                 buy_price = best_bid_price # Quote at best bid (passive)
-                # sell_price remains best_ask - 1 (aggressive)
                 buy_volume = max(0, base_volume - position // 2) # Reduce buy volume
-                # logger.print(f"MM Skew LONG for {symbol}: Buy@Bid({buy_volume}), Sell@Ask-1({sell_volume})")
 
             # If significantly short, make sell quote passive, buy quote aggressive, adjust volume
             elif position < -base_volume / 2:
                 sell_price = best_ask_price # Quote at best ask (passive)
-                # buy_price remains best_bid + 1 (aggressive)
                 sell_volume = max(0, base_volume - abs(position) // 2) # Reduce sell volume
-                # logger.print(f"MM Skew SHORT for {symbol}: Buy@Bid+1({buy_volume}), Sell@Ask({sell_volume})")
-
-            # else: # Near flat, quote aggressively on both sides with base volume
-                # logger.print(f"MM Skew FLAT for {symbol}: Buy@Bid+1({buy_volume}), Sell@Ask-1({sell_volume})")
-
 
             # --- Place Orders ---
             # Place Buy Order
@@ -266,8 +263,7 @@ class Trader:
                 # Ensure our buy price is still below the best ask
                 if buy_price < best_ask_price:
                     orders.append(Order(symbol, buy_price, final_buy_volume))
-                    # logger.print(f"Potential MM Buy Order: {final_buy_volume} {symbol}@{buy_price}")
-                # else:
+                # else: # Optional logging if needed
                     # logger.print(f"MM Buy price {buy_price} crossed ask {best_ask_price} for {symbol}, skipped.")
 
 
@@ -277,16 +273,18 @@ class Trader:
                  # Ensure our sell price is still above the best bid
                 if sell_price > best_bid_price:
                     orders.append(Order(symbol, sell_price, -final_sell_volume)) # Negative volume for sell
-                    # logger.print(f"Potential MM Sell Order: {-final_sell_volume} {symbol}@{sell_price}")
-                # else:
+                # else: # Optional logging if needed
                     # logger.print(f"MM Sell price {sell_price} crossed bid {best_bid_price} for {symbol}, skipped.")
+
+        # else: # Optional logging if spread is too tight
+            # logger.print(f"Spread {spread} for {symbol} is below threshold {spread_threshold}, no MM orders placed.")
 
         return orders
 
 
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
         """
-        Main trading logic: Market Make ONLY on RAINFOREST_RESIN
+        Main trading logic: Market Make on RAINFOREST_RESIN and KELP.
         """
         result = {symbol: [] for symbol in state.listings.keys()} # Initialize result dict
 
@@ -294,25 +292,45 @@ class Trader:
         self.log_position_changes(state.position, state.timestamp) # Log changes from previous state
 
         # --- 1. Market Making for RAINFOREST_RESIN ---
-        symbol = "RAINFOREST_RESIN"
-        if symbol in state.order_depths:
-            depth = state.order_depths[symbol]
-            current_position = state.position.get(symbol, 0)
-            # Use a local dict for limit checking within MM for this symbol
-            pending_pos_delta_mm = {}
+        symbol_resin = "RAINFOREST_RESIN"
+        if symbol_resin in state.order_depths:
+            depth_resin = state.order_depths[symbol_resin]
+            current_pos_resin = state.position.get(symbol_resin, 0)
+            pending_pos_delta_resin = {} # Local dict for limit checking within this block
 
-            potential_mm_orders = self.get_market_making_orders(symbol, depth, current_position)
+            potential_mm_orders_resin = self.get_market_making_orders(
+                symbol_resin,
+                depth_resin,
+                current_pos_resin,
+                self.mm_spread_threshold_resin, # Pass RESIN threshold
+                self.mm_base_volume_resin       # Pass RESIN volume
+            )
 
-            for order in potential_mm_orders:
-                # Check limit before adding MM order, considering potential orders already added this tick
-                if self._can_place_order(order.symbol, order.quantity, current_position, pending_pos_delta_mm):
+            for order in potential_mm_orders_resin:
+                if self._can_place_order(order.symbol, order.quantity, current_pos_resin, pending_pos_delta_resin):
                     result[order.symbol].append(order)
-                    # Update local pending delta for subsequent checks *within this MM block*
-                    pending_pos_delta_mm[order.symbol] = pending_pos_delta_mm.get(order.symbol, 0) + order.quantity
-                # else:
-                    # logger.print(f"MM Order skipped for {symbol} due to limit.")
-        # else:
-            # logger.print(f"No order depth data for {symbol}, skipping MM.")
+                    pending_pos_delta_resin[order.symbol] = pending_pos_delta_resin.get(order.symbol, 0) + order.quantity
+
+        # --- 2. Market Making for KELP ---
+        symbol_kelp = "KELP"
+        if symbol_kelp in state.order_depths:
+            depth_kelp = state.order_depths[symbol_kelp]
+            current_pos_kelp = state.position.get(symbol_kelp, 0)
+            pending_pos_delta_kelp = {} # Separate local dict for KELP limit checking
+
+            potential_mm_orders_kelp = self.get_market_making_orders(
+                symbol_kelp,
+                depth_kelp,
+                current_pos_kelp,
+                self.mm_spread_threshold_kelp, # Pass KELP threshold
+                self.mm_base_volume_kelp       # Pass KELP volume
+            )
+
+            for order in potential_mm_orders_kelp:
+                # Check limit against KELP's current position and pending KELP orders
+                if self._can_place_order(order.symbol, order.quantity, current_pos_kelp, pending_pos_delta_kelp):
+                    result[order.symbol].append(order)
+                    pending_pos_delta_kelp[order.symbol] = pending_pos_delta_kelp.get(order.symbol, 0) + order.quantity
 
 
         # --- Final Steps ---
@@ -323,8 +341,6 @@ class Trader:
         orders_to_log = {symbol: orders for symbol, orders in result.items() if orders}
         if orders_to_log:
              logger.print(f"Timestamp: {state.timestamp}, Final Orders: {orders_to_log}")
-        # else: # Reduce logging noise
-             # logger.print(f"Timestamp: {state.timestamp}, No orders placed.")
 
         # Update previous positions AFTER all logic for the current timestamp is done
         self.previous_positions = state.position.copy()
@@ -342,14 +358,14 @@ class Trader:
         """
         log_entry = []
         all_symbols = set(current_positions.keys()) | set(self.previous_positions.keys())
-        # Only log for RAINFOREST_RESIN if desired, or keep all for general info
-        symbols_to_log = ["RAINFOREST_RESIN"] # Or use sorted(list(all_symbols)) for all
+        # Log for both MM symbols now
+        symbols_to_log = ["RAINFOREST_RESIN", "KELP"] # Or use sorted(list(all_symbols)) for all
         for symbol in symbols_to_log:
-            if symbol not in all_symbols: continue # Skip if symbol not present in either dict
+            if symbol not in all_symbols: continue
             prev_pos = self.previous_positions.get(symbol, 0)
             curr_pos = current_positions.get(symbol, 0)
             if prev_pos != curr_pos:
-                log_entry.append(f"{symbol}: {prev_pos}->{curr_pos}") # Shortened format
+                log_entry.append(f"{symbol}: {prev_pos}->{curr_pos}")
 
-        if log_entry: # Only log if there were changes
+        if log_entry:
             logger.print(f"Pos Changes @ {timestamp}: {', '.join(log_entry)}")
