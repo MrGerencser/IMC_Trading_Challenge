@@ -1,105 +1,102 @@
-from datamodel import OrderDepth, TradingState, Order
-from typing import List, Dict
-import numpy as np
-import jsonpickle  # Add this import
+from datamodel import OrderDepth, UserId, TradingState, Order
+from typing import List
+import string
+import math
+
+
 
 class Trader:
-    POSITION_LIMITS = {
-        "RAINFOREST_RESIN": 50,
-        "KELP": 50,
-        "SQUID_INK": 50
-    }
 
+    def cdf_standard_normal(x):
+     """Approximate CDF of the standard normal distribution."""
+     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    
+    def vega(S, K, r, T, sigma):
+        """Partial derivative of the call price wrt sigma (aka Vega)."""
+        d1 = (math.log(S/K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        return S * math.sqrt(T) * (1 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * d1**2)
+
+
+    def black_scholes_call_price(self, S, K, r, T, sigma):
+        """
+        Computes the Black–Scholes price for a call option.
+        S: Underlying price
+        K: Strike price
+        r: Risk-free rate
+        T: Time to expiration (in years)
+        sigma: volatility (annualized)
+        """
+        if T <= 0:
+            # If time to expiry is 0, the option's value is max(S-K, 0).
+            return max(S - K, 0)
+        # d1 and d2
+        d1 = (math.log(S/K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        # Call price
+        call_val = (S * self.cdf_standard_normal(d1)) - (K * math.exp(-r * T) * self.cdf_standard_normal(d2))
+        return call_val
+    
+    def implied_vol_call_price(self, S, K, r, T, market_price, initial_guess=0.2, tol=1e-6, max_iterations=100):
+        """
+        Numerically find implied volatility via Newton–Raphson.
+        S: Underlying price
+        K: Strike price
+        r: Risk-free rate
+        T: Time to expiration (in years)
+        market_price: the current market premium of the option
+        initial_guess: starting volatility guess
+        tol: tolerance for the final result
+        max_iterations: maximum number of iterations
+        """
+        sigma = initial_guess
+        for i in range(max_iterations):
+            price = self.black_scholes_call_price(S, K, r, T, sigma)
+            diff = price - market_price  # how far off we are
+            if abs(diff) < tol:
+                return sigma  # found a good enough solution
+            v = self.vega(S, K, r, T, sigma)
+            if v < 1e-8:
+                # If vega is extremely small, we risk dividing by zero or huge jumps.
+                # Could switch to a fallback method (bisection) or stop.
+                break
+            # Newton step
+            sigma = sigma - diff / v
+            # keep sigma positive
+            if sigma < 0:
+                sigma = 1e-5
+        # If we exit the loop without returning, we can either raise an error or return the last sigma
+        return sigma
+        # Edge case: if option is deep in-the-money and market_price ~ (S-K),
+        # you might want to set a floor or do a quick check here.
+        
     def run(self, state: TradingState):
+        # Only method required. It takes all buy and sell orders for all symbols as an input, and outputs a list of orders to be sent
+        print("traderData: " + state.traderData)
+        print("Observations: " + str(state.observations))
         result = {}
-        conversions = 0
-        
-        # Load persistent state using jsonpickle
-        if state.traderData:
-            memory = jsonpickle.decode(state.traderData)
-        else:
-            memory = {"cycle_count": 0, "products": {}}
-        
-        # Increment cycle counter
-        memory["cycle_count"] = memory.get("cycle_count", 0) + 1
-        
-        # Only trade every N cycles to avoid accumulating too many orders
-        should_trade = memory["cycle_count"] % 5 == 0
-        
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
             orders: List[Order] = []
-            position = state.position.get(product, 0)
-            limit = self.POSITION_LIMITS[product]
+            acceptable_price = 10;  # Participant should calculate this value
+            print("Acceptable price : " + str(acceptable_price))
+            print("Buy Order depth : " + str(len(order_depth.buy_orders)) + ", Sell order depth : " + str(len(order_depth.sell_orders)))
+    
+            if len(order_depth.sell_orders) != 0:
+                best_ask, best_ask_amount = list(order_depth.sell_orders.items())[0]
+                if int(best_ask) < acceptable_price:
+                    print("BUY", str(-best_ask_amount) + "x", best_ask)
+                    orders.append(Order(product, best_ask, -best_ask_amount))
+    
+            if len(order_depth.buy_orders) != 0:
+                best_bid, best_bid_amount = list(order_depth.buy_orders.items())[0]
+                if int(best_bid) > acceptable_price:
+                    print("SELL", str(best_bid_amount) + "x", best_bid)
+                    orders.append(Order(product, best_bid, -best_bid_amount))
             
-            # Initialize product memory if needed
-            if product not in memory["products"]:
-                memory["products"][product] = {"mid_prices": []}
-            
-            if len(order_depth.buy_orders) == 0 or len(order_depth.sell_orders) == 0:
-                result[product] = []
-                continue
-
-            best_bid = max(order_depth.buy_orders.keys())
-            best_ask = min(order_depth.sell_orders.keys())
-            mid_price = (best_bid + best_ask) / 2
-            spread = best_ask - best_bid
-            
-            # Update price history
-            memory["products"][product]["mid_prices"].append(mid_price)
-            if len(memory["products"][product]["mid_prices"]) > 20:
-                memory["products"][product]["mid_prices"].pop(0)
-                
-            # Skip trading if it's not a trade cycle
-            if not should_trade:
-                result[product] = []
-                continue
-
-            if product in ["RAINFOREST_RESIN", "KELP"]:
-                if spread > 2:
-                    bid_price = int(mid_price - 1)
-                    ask_price = int(mid_price + 1)
-                    
-                    # Use smaller volumes
-                    buy_volume = min(1, limit - position)
-                    sell_volume = min(1, limit + position)
-
-                    if buy_volume > 0:
-                        orders.append(Order(product, bid_price, buy_volume))
-                    if sell_volume > 0:
-                        orders.append(Order(product, ask_price, -sell_volume))
-
-            elif product == "SQUID_INK":
-                price_memory = memory["products"][product]["mid_prices"]
-                
-                # Calculate simple EMA like in algo_lucas.py
-                alpha = 0.17  # Smoothing factor
-                
-                prev_ema = memory["products"][product].get("ema")
-                if prev_ema is None:
-                    ema = mid_price  # Initialize
-                else:
-                    ema = alpha * mid_price + (1 - alpha) * prev_ema
-                
-                memory["products"][product]["ema"] = ema
-                
-                # Use EMA as moving average
-                threshold = 3
-                short_term_ma = ema
-                
-                # Smaller volumes to reduce risk
-                if mid_price < short_term_ma - threshold:
-                    buy_volume = min(1, limit - position)
-                    if buy_volume > 0:
-                        orders.append(Order(product, best_ask, buy_volume))
-                        
-                elif mid_price > short_term_ma + threshold:
-                    sell_volume = min(1, limit + position)
-                    if sell_volume > 0:
-                        orders.append(Order(product, best_bid, -sell_volume))
-
             result[product] = orders
-
-        # Serialize memory using jsonpickle
-        traderData = jsonpickle.encode(memory)
+    
+    
+        traderData = "SAMPLE" # String value holding Trader state data required. It will be delivered as TradingState.traderData on next execution.
+        
+        conversions = 1
         return result, conversions, traderData
