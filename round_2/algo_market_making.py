@@ -1,8 +1,8 @@
 import json
-import statistics # Allowed package
+import statistics # Keep for potential fallback or other strategies
 import math # Allowed package
 import jsonpickle # Allowed package for traderData serialization
-from typing import Any, Dict, List # Keep basic typing
+from typing import Any, Dict, List, Optional # Keep basic typing, add Optional
 
 # Assuming datamodel.py defines these classes:
 # Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
@@ -171,71 +171,80 @@ class Trader:
         self.previous_positions = {}
 
         # --- MM Strategy Parameters ---
-        self.mm_spread_threshold_resin = 4
+        self.mm_spread_threshold_resin = 7
         self.mm_base_volume_resin = 25
         self.mm_spread_threshold_kelp = 2
         self.mm_base_volume_kelp = 25
 
-        # --- SQUID_INK Mean Reversion Parameters ---
-        self.squid_hv_window = 50 # Lookback window for volatility calculation
-        self.squid_entry_threshold_pct = 1.8 # Enter if deviation > 180% of HV
-        self.squid_exit_threshold_pct = 1.0 # Exit if deviation < 100% of HV (and profitable)
-        self.squid_warmup_ticks = 50 # Number of ticks after window full before allowing entry
-        # Use standard list for price history
-        self.squid_prices: List[float] = []
-        self.squid_entry_price: float | None = None # Track entry price for PnL calculation
-        self.squid_calc_count: int = 0 # Counter for warmup period
+        # --- SQUID_INK Mean Reversion Parameters (EWMA based) ---
+        self.squid_ewma_span = 20 # Span for EWMA/EWMSD calculation (similar to old window)
+        self.squid_alpha = 2 / (self.squid_ewma_span + 1) # Smoothing factor for EWMA/EWMSD
+        self.squid_entry_threshold_pct_hv = 1.4 # Enter if deviation > X * EWMSD (Example: Higher based on hint)
+        self.squid_exit_threshold_pct_hv = 0.5  # Exit if deviation < X * EWMSD (Example: Lower based on hint)
+        self.squid_stop_loss_pct_hv = 4.0   # Stop loss if loss exceeds X * EWMSD (Example: Wider based on hint)
+        self.squid_target_entry_volume = 50 # Target total volume to try and fill on entry (Example)
+        self.squid_max_levels_sweep = 3     # How many book levels to check for aggressive volume
+        self.squid_limit_order_ratio = 0.5 # Ratio (0.0 to 1.0) of target volume to place as passive limit order (Example: 50%)
 
+        # --- SQUID_INK State Variables ---
+        self.squid_ewma: Optional[float] = None # Exponentially Weighted Moving Average
+        self.squid_ewm_variance: Optional[float] = None # Exponentially Weighted Moving Variance
+        self.squid_entry_price: Optional[float] = None # Track entry price for PnL and stop-losseg
+
+    def _calculate_ewma_ewmsd(self, current_wap: float):
+        """Updates EWMA and EWM Variance based on the current WAP."""
+        if self.squid_ewma is None or self.squid_ewm_variance is None:
+            # Initialize EWMA and Variance with the first WAP observed
+            self.squid_ewma = current_wap
+            self.squid_ewm_variance = 0 # Initial variance is zero
+        else:
+            # Store previous EWMA before updating it
+            prev_ewma = self.squid_ewma
+            # Update EWMA
+            self.squid_ewma = self.squid_alpha * current_wap + (1 - self.squid_alpha) * prev_ewma
+            # Update EWM Variance using the previous EWMA
+            self.squid_ewm_variance = (1 - self.squid_alpha) * (self.squid_ewm_variance + self.squid_alpha * (current_wap - prev_ewma)**2)
+
+    def _get_ewmsd(self) -> Optional[float]:
+        """Returns the EWMSD (sqrt of variance), or None if variance is not calculated."""
+        if self.squid_ewm_variance is None:
+            return None
+        # Avoid sqrt of negative number due to potential floating point inaccuracies
+        if self.squid_ewm_variance < 0:
+             return 0.0
+        return math.sqrt(self.squid_ewm_variance)
 
     def _serialize_trader_data(self) -> str:
         """Serializes strategy state using jsonpickle"""
         state_data = {
-            "squid_prices": self.squid_prices,
+            "squid_ewma": self.squid_ewma,
+            "squid_ewm_variance": self.squid_ewm_variance,
             "squid_entry_price": self.squid_entry_price,
-            "squid_calc_count": self.squid_calc_count, # Add counter to serialization
         }
         try:
-            # Use jsonpickle for encoding complex Python objects if needed
-            return jsonpickle.encode(state_data, unpicklable=False) # unpicklable=False for smaller string if complex objects aren't needed back
+            return jsonpickle.encode(state_data, unpicklable=False)
         except Exception as e:
             logger.print(f"Error serializing trader data with jsonpickle: {e}")
-            return "" # Return empty string on error
+            return ""
 
     def _deserialize_trader_data(self, trader_data: str) -> None:
         """Deserializes strategy state using jsonpickle"""
         if trader_data:
             try:
                 data = jsonpickle.decode(trader_data)
-                # Load historical prices (should be a list)
-                self.squid_prices = data.get("squid_prices", [])
-                # Ensure it doesn't exceed max window size after loading
-                if len(self.squid_prices) > self.squid_hv_window:
-                    self.squid_prices = self.squid_prices[-self.squid_hv_window:]
+                self.squid_ewma = data.get("squid_ewma", None)
+                self.squid_ewm_variance = data.get("squid_ewm_variance", None)
                 self.squid_entry_price = data.get("squid_entry_price", None)
-                self.squid_calc_count = data.get("squid_calc_count", 0) # Load counter, default to 0 if missing
-                # logger.print(f"Deserialized trader_data: Prices len {len(self.squid_prices)}, Entry {self.squid_entry_price}, CalcCount {self.squid_calc_count}")
             except Exception as e:
-                logger.print(f"Error decoding trader data with jsonpickle: {e}. Resetting state.")
-                # Reset to default if decoding fails
-                self.squid_prices = []
+                logger.print(f"Error decoding trader data with jsonpickle: {e}. Resetting SQUID state.")
+                self.squid_ewma = None
+                self.squid_ewm_variance = None
                 self.squid_entry_price = None
-                self.squid_calc_count = 0 # Reset counter on error
         else:
-            # logger.print("No trader data found, initializing fresh state.")
-            # Ensure state is default if no data string is provided
-            self.squid_prices = []
+            self.squid_ewma = None
+            self.squid_ewm_variance = None
             self.squid_entry_price = None
-            self.squid_calc_count = 0 # Reset counter for fresh state
 
-    # Helper to manage the price history list
-    def _update_price_history(self, price: float):
-        """Adds a price to the history list and trims it to the window size."""
-        self.squid_prices.append(price)
-        # Keep only the last 'squid_hv_window' prices
-        if len(self.squid_prices) > self.squid_hv_window:
-            self.squid_prices.pop(0) # Remove the oldest price
-
-    # Helper function to check position limits before placing an order - Kept as it's used by MM & MR
     def _can_place_order(self, symbol: Symbol, quantity: int, current_pos: int, pending_pos_delta: Dict[Symbol, int]) -> bool:
         limit = self.position_limits.get(symbol)
         if limit is None:
@@ -248,28 +257,74 @@ class Trader:
         if abs(final_pos) <= limit:
             return True
         else:
-            # logger.print(f"Order rejected for {symbol}: Quantity {quantity} would exceed limit {limit}. Current: {current_pos}, Pending Delta: {pending_delta}, Resulting: {final_pos}")
             return False
 
-    # Helper to calculate Weighted Average Price (WAP) - Re-added
-    def _calculate_wap(self, depth: OrderDepth) -> float | None:
-        """Calculates the Weighted Average Price from order book depth."""
+    def _calculate_wap(self, depth: OrderDepth, levels: int = 3) -> Optional[float]:
+        """
+        Calculates the Weighted Average Price (WAP) using up to 'levels' levels
+        of the order book depth.
+        """
+        # Ensure depth exists and has orders
         if not depth.buy_orders or not depth.sell_orders:
-            return None # Cannot calculate WAP without both sides
+            return None
 
-        best_bid = max(depth.buy_orders.keys())
-        best_ask = min(depth.sell_orders.keys())
-        bid_vol = depth.buy_orders[best_bid]
-        ask_vol = depth.sell_orders[best_ask]
+        # Sort buy orders descending (best bid first) and sell orders ascending (best ask first)
+        # Assuming depth.buy_orders and depth.sell_orders are dicts {price: volume}
+        sorted_bids = sorted(depth.buy_orders.items(), key=lambda item: item[0], reverse=True)
+        sorted_asks = sorted(depth.sell_orders.items(), key=lambda item: item[0])
 
-        # Ensure total volume is not zero to avoid division by zero
-        if bid_vol + ask_vol == 0:
-            return (best_bid + best_ask) / 2 # Fallback to mid-price if volumes are zero
+        total_bid_vol_price = 0.0
+        total_ask_vol_price = 0.0
+        total_bid_vol = 0.0
+        total_ask_vol = 0.0
 
-        wap = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+        # Calculate weighted price sum and total volume for top 'levels' bids
+        for i in range(min(levels, len(sorted_bids))):
+            price, volume = sorted_bids[i]
+            total_bid_vol_price += price * volume
+            total_bid_vol += volume
+
+        # Calculate weighted price sum and total volume for top 'levels' asks
+        for i in range(min(levels, len(sorted_asks))):
+            price, volume = sorted_asks[i]
+            total_ask_vol_price += price * volume
+            total_ask_vol += volume
+
+        # If total volume on either side (up to 'levels') is zero, we can't calculate WAP reliably
+        if total_bid_vol == 0 or total_ask_vol == 0:
+             # Fallback to mid-price of best bid/ask if possible
+             if sorted_bids and sorted_asks:
+                 best_bid = sorted_bids[0][0]
+                 best_ask = sorted_asks[0][0]
+                 return (best_bid + best_ask) / 2
+             else:
+                 return None # Cannot determine a price
+
+        # Calculate the Weighted Average Price using volumes from the opposite side as weights
+        # WAP = (AvgBidPrice * TotalAskVol + AvgAskPrice * TotalBidVol) / (TotalBidVol + TotalAskVol)
+        # where AvgBidPrice = total_bid_vol_price / total_bid_vol, etc.
+        # Simplified: WAP = (best_bid * total_ask_vol + best_ask * total_bid_vol) / (total_bid_vol + total_ask_vol) is for level 1 only.
+        # For multi-level, a common approach is microprice:
+        # Microprice = (BestBid * AskVol_L1 + BestAsk * BidVol_L1) / (BidVol_L1 + AskVol_L1) - this is the original WAP.
+
+        # Let's try a simpler multi-level WAP: Average price weighted by *own* level volume up to N levels
+        # This isn't standard WAP, but reflects average execution price for N levels
+        # avg_bid_price = total_bid_vol_price / total_bid_vol
+        # avg_ask_price = total_ask_vol_price / total_ask_vol
+        # wap = (avg_bid_price * total_ask_vol + avg_ask_price * total_bid_vol) / (total_bid_vol + total_ask_vol)
+
+        # Let's stick to the standard definition but use volumes from the first level only for weighting,
+        # but use best_bid/ask from the actual book. This is the most common WAP definition.
+        best_bid_price, best_bid_vol = sorted_bids[0]
+        best_ask_price, best_ask_vol = sorted_asks[0]
+
+        if best_bid_vol + best_ask_vol == 0:
+             return (best_bid_price + best_ask_price) / 2 # Mid-price fallback
+
+        wap = (best_bid_price * best_ask_vol + best_ask_price * best_bid_vol) / (best_bid_vol + best_ask_vol)
+
         return wap
 
-    # Standard market making logic (with inventory skewing) - Kept as it's the core strategy now
     def get_market_making_orders(self, symbol: Symbol, depth: OrderDepth, position: int, spread_threshold: int, base_volume: int) -> list[Order]:
         """
         Get market making orders for a single symbol, respecting position limits
@@ -285,259 +340,313 @@ class Trader:
         best_bid_price = max(depth.buy_orders.keys()) if depth.buy_orders else None
         best_ask_price = min(depth.sell_orders.keys()) if depth.sell_orders else None
 
-        # Need both bid and ask to make a market
         if best_bid_price is None or best_ask_price is None:
             return orders
 
-        # Calculate remaining capacity based on the *effective* position passed in
         buy_capacity = position_limit - position
-        sell_capacity = position_limit + position # Capacity to sell (towards negative limit)
+        sell_capacity = position_limit + position
 
-        # Place orders only if spread is wide enough and we have capacity
         spread = best_ask_price - best_bid_price
-        if spread >= spread_threshold: # Use the passed threshold
-            # --- Inventory Skewing ---
-            # Default: Place 1 tick inside spread
+        if spread >= spread_threshold:
             buy_price = best_bid_price + 1
             sell_price = best_ask_price - 1
-            # Use the passed base_volume
             buy_volume = base_volume
             sell_volume = base_volume
 
-            # If significantly long, make buy quote passive, sell quote aggressive, adjust volume
             if position > base_volume / 2:
-                buy_price = best_bid_price # Quote at best bid (passive)
-                buy_volume = max(0, base_volume - position // 2) # Reduce buy volume
+                buy_price = best_bid_price
+                buy_volume = max(0, base_volume - position // 2)
 
-            # If significantly short, make sell quote passive, buy quote aggressive, adjust volume
             elif position < -base_volume / 2:
-                sell_price = best_ask_price # Quote at best ask (passive)
-                sell_volume = max(0, base_volume - abs(position) // 2) # Reduce sell volume
+                sell_price = best_ask_price
+                sell_volume = max(0, base_volume - abs(position) // 2)
 
-            # --- Place Orders ---
-            # Place Buy Order
             final_buy_volume = min(buy_volume, buy_capacity)
             if final_buy_volume > 0:
                 if buy_price < best_ask_price:
                     orders.append(Order(symbol, buy_price, final_buy_volume))
 
-            # Place Sell Order
             final_sell_volume = min(sell_volume, sell_capacity)
             if final_sell_volume > 0:
                 if sell_price > best_bid_price:
-                    orders.append(Order(symbol, sell_price, -final_sell_volume)) # Negative volume for sell
+                    orders.append(Order(symbol, sell_price, -final_sell_volume))
 
         return orders
-
 
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
         """
         Main trading logic:
-        1. Market Make on RAINFOREST_RESIN and KELP.
-        2. Mean Reversion on SQUID_INK.
+        1. Deserialize state.
+        2. Market Make on RAINFOREST_RESIN and KELP.
+        3. Mean Reversion (EWMA-based) on SQUID_INK.
+        4. Serialize state and return orders.
         """
-        # --- 0. Deserialize State & Log Position Changes ---
         self._deserialize_trader_data(state.traderData)
-        self.log_position_changes(state.position, state.timestamp) # Log changes from previous state
+        self.log_position_changes(state.position, state.timestamp)
 
-        result = {symbol: [] for symbol in state.listings.keys()} # Initialize result dict
-        # Use ONE pending_pos_delta dict for ALL strategies in this timestamp
+        result = {symbol: [] for symbol in state.listings.keys()}
         pending_pos_delta = {symbol: 0 for symbol in state.listings.keys()}
 
-        # --- 1. Market Making for RAINFOREST_RESIN ---
-        symbol_resin = "RAINFOREST_RESIN"
-        if symbol_resin in state.order_depths:
-            depth_resin = state.order_depths[symbol_resin]
-            current_pos_resin = state.position.get(symbol_resin, 0)
-            # Use the shared pending_pos_delta for effective position calculation
-            effective_pos_resin = current_pos_resin + pending_pos_delta.get(symbol_resin, 0)
+        # --- Market Making Logic (Commented Out) ---
+        # symbol_resin = "RAINFOREST_RESIN"
+        # if symbol_resin in state.order_depths:
+        #     depth_resin = state.order_depths[symbol_resin]
+        #     current_pos_resin = state.position.get(symbol_resin, 0)
+        #     effective_pos_resin = current_pos_resin + pending_pos_delta.get(symbol_resin, 0)
+        #
+        #     potential_mm_orders_resin = self.get_market_making_orders(
+        #         symbol_resin, depth_resin, effective_pos_resin,
+        #         self.mm_spread_threshold_resin, self.mm_base_volume_resin
+        #     )
+        #     for order in potential_mm_orders_resin:
+        #         if self._can_place_order(order.symbol, order.quantity, current_pos_resin, pending_pos_delta):
+        #             result[order.symbol].append(order)
+        #             pending_pos_delta[order.symbol] += order.quantity
+        #
+        # symbol_kelp = "KELP"
+        # if symbol_kelp in state.order_depths:
+        #     depth_kelp = state.order_depths[symbol_kelp]
+        #     current_pos_kelp = state.position.get(symbol_kelp, 0)
+        #     effective_pos_kelp = current_pos_kelp + pending_pos_delta.get(symbol_kelp, 0)
+        #
+        #     potential_mm_orders_kelp = self.get_market_making_orders(
+        #         symbol_kelp, depth_kelp, effective_pos_kelp,
+        #         self.mm_spread_threshold_kelp, self.mm_base_volume_kelp
+        #     )
+        #     for order in potential_mm_orders_kelp:
+        #          if self._can_place_order(order.symbol, order.quantity, current_pos_kelp, pending_pos_delta):
+        #             result[order.symbol].append(order)
+        #             pending_pos_delta[order.symbol] += order.quantity
+        # --- End Market Making Logic ---
 
-            potential_mm_orders_resin = self.get_market_making_orders(
-                symbol_resin,
-                depth_resin,
-                effective_pos_resin, # Use effective position
-                self.mm_spread_threshold_resin,
-                self.mm_base_volume_resin
-            )
-
-            for order in potential_mm_orders_resin:
-                # Check limit against total current position + all pending orders so far
-                if self._can_place_order(order.symbol, order.quantity, current_pos_resin, pending_pos_delta):
-                    result[order.symbol].append(order)
-                    pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
-
-        # --- 2. Market Making for KELP ---
-        symbol_kelp = "KELP"
-        if symbol_kelp in state.order_depths:
-            depth_kelp = state.order_depths[symbol_kelp]
-            current_pos_kelp = state.position.get(symbol_kelp, 0)
-            # Use the shared pending_pos_delta for effective position calculation
-            effective_pos_kelp = current_pos_kelp + pending_pos_delta.get(symbol_kelp, 0)
-
-            potential_mm_orders_kelp = self.get_market_making_orders(
-                symbol_kelp,
-                depth_kelp,
-                effective_pos_kelp, # Use effective position
-                self.mm_spread_threshold_kelp,
-                self.mm_base_volume_kelp
-            )
-
-            for order in potential_mm_orders_kelp:
-                 # Check limit against total current position + all pending orders so far
-                if self._can_place_order(order.symbol, order.quantity, current_pos_kelp, pending_pos_delta):
-                    result[order.symbol].append(order)
-                    pending_pos_delta[order.symbol] = pending_pos_delta.get(order.symbol, 0) + order.quantity
-
-        # --- 3. Mean Reversion for SQUID_INK ---
+        # --- SQUID_INK Mean Reversion Logic ---
         symbol_squid = "SQUID_INK"
         if symbol_squid in state.order_depths:
             depth_squid = state.order_depths[symbol_squid]
             current_pos_squid = state.position.get(symbol_squid, 0)
             limit_squid = self.position_limits.get(symbol_squid, 0)
 
-            # Calculate current fair price (WAP) and update history
             wap_squid = self._calculate_wap(depth_squid)
+
             if wap_squid is not None:
-                self._update_price_history(wap_squid) # Use helper to manage list size
-                # logger.print(f"SQUID WAP: {wap_squid}, History len: {len(self.squid_prices)}")
+                self._calculate_ewma_ewmsd(wap_squid)
 
-            # Check if we have enough data for calculations (list is full)
-            if len(self.squid_prices) == self.squid_hv_window and wap_squid is not None:
-                try:
-                    # Calculate historical mean and volatility using statistics package
-                    mean_price = statistics.mean(self.squid_prices)
-                    # Need at least 2 data points for stdev
-                    if len(self.squid_prices) >= 2:
-                        hv = statistics.stdev(self.squid_prices)
-                    else:
-                        hv = 0 # Cannot calculate stdev with < 2 points
-                    # logger.print(f"SQUID Mean: {mean_price:.2f}, HV: {hv:.2f}")
+                ewmsd = self._get_ewmsd()
 
-                    if hv > 0: # Avoid division by zero or acting on zero volatility
-                        # Increment the calculation counter only when HV is valid
-                        self.squid_calc_count += 1
+                # Add logging for SQUID state
+                # logger.print(f"SQUID @ {state.timestamp}: WAP={wap_squid:.2f}, EWMA={self.squid_ewma:.2f}, EWMSD={ewmsd:.4f}, Pos={current_pos_squid}, EntryP={self.squid_entry_price}")
 
-                        entry_threshold_abs = self.squid_entry_threshold_pct * hv
-                        exit_threshold_abs = self.squid_exit_threshold_pct * hv
-                        current_deviation = abs(wap_squid - mean_price)
-                        effective_pos_squid = current_pos_squid + pending_pos_delta.get(symbol_squid, 0) # Current pos + MM orders
+                if self.squid_ewma is not None and ewmsd is not None and ewmsd > 1e-6:
+                    try:
+                        entry_threshold_abs = self.squid_entry_threshold_pct_hv * ewmsd
+                        exit_threshold_abs = self.squid_exit_threshold_pct_hv * ewmsd
+                        stop_loss_threshold_abs = self.squid_stop_loss_pct_hv * ewmsd
+                        current_deviation = abs(wap_squid - self.squid_ewma)
+                        effective_pos_squid = current_pos_squid + pending_pos_delta.get(symbol_squid, 0)
 
                         # --- Exit Logic ---
-                        # (Exit logic remains the same, no warmup needed for exits)
                         if effective_pos_squid != 0 and self.squid_entry_price is not None:
                             pnl_per_unit = 0
+                            stop_loss_hit = False
+                            take_profit_hit = False # Renamed for clarity
+
                             if effective_pos_squid > 0: # Long position
                                 pnl_per_unit = wap_squid - self.squid_entry_price
+                                if wap_squid < self.squid_entry_price - stop_loss_threshold_abs:
+                                    stop_loss_hit = True
+                                    logger.print(f"SQUID: STOP LOSS (Long) @ {wap_squid:.2f} (Entry: {self.squid_entry_price:.2f}, Threshold: {stop_loss_threshold_abs:.2f})")
+                                elif current_deviation < exit_threshold_abs and pnl_per_unit > 0:
+                                    take_profit_hit = True
+                                    logger.print(f"SQUID: TAKE PROFIT (Long) @ {wap_squid:.2f} (Entry: {self.squid_entry_price:.2f}, Deviation: {current_deviation:.2f} < {exit_threshold_abs:.2f})")
+
                             else: # Short position
                                 pnl_per_unit = self.squid_entry_price - wap_squid
+                                if wap_squid > self.squid_entry_price + stop_loss_threshold_abs:
+                                    stop_loss_hit = True
+                                    logger.print(f"SQUID: STOP LOSS (Short) @ {wap_squid:.2f} (Entry: {self.squid_entry_price:.2f}, Threshold: {stop_loss_threshold_abs:.2f})")
+                                elif current_deviation < exit_threshold_abs and pnl_per_unit > 0:
+                                    take_profit_hit = True
+                                    logger.print(f"SQUID: TAKE PROFIT (Short) @ {wap_squid:.2f} (Entry: {self.squid_entry_price:.2f}, Deviation: {current_deviation:.2f} < {exit_threshold_abs:.2f})")
 
-                            # logger.print(f"SQUID Check Exit: Dev={current_deviation:.2f}, ExitThr={exit_threshold_abs:.2f}, PnL/unit={pnl_per_unit:.2f}")
-                            if current_deviation < exit_threshold_abs and pnl_per_unit > 0:
-                                # Profitable exit condition met, close position with market order
-                                close_quantity = -effective_pos_squid # Target zero position
-                                order_qty = 0
-                                close_price = None # Initialize close_price
+                            # Place exit order if stop loss or take profit is hit
+                            if stop_loss_hit or take_profit_hit:
+                                close_quantity = -effective_pos_squid # Quantity to flatten position
+                                if self._can_place_order(symbol_squid, close_quantity, current_pos_squid, pending_pos_delta):
+                                    # Use aggressive limit order (cross the spread by 1 tick) to ensure fill
+                                    exit_price = None
+                                    if close_quantity > 0 and depth_squid.sell_orders: # Need to buy back
+                                        best_ask = min(depth_squid.sell_orders.keys())
+                                        exit_price = best_ask # Hit the best ask
+                                    elif close_quantity < 0 and depth_squid.buy_orders: # Need to sell back
+                                        best_bid = max(depth_squid.buy_orders.keys())
+                                        exit_price = best_bid # Hit the best bid
 
-                                if close_quantity > 0 and depth_squid.sell_orders: # Need to buy back
-                                    best_ask_exit = min(depth_squid.sell_orders.keys())
-                                    available_volume = depth_squid.sell_orders[best_ask_exit]
-                                    order_qty = min(close_quantity, available_volume)
-                                    close_price = best_ask_exit
-                                elif close_quantity < 0 and depth_squid.buy_orders: # Need to sell back
-                                    best_bid_exit = max(depth_squid.buy_orders.keys())
-                                    available_volume = depth_squid.buy_orders[best_bid_exit]
-                                    order_qty = max(close_quantity, -available_volume) # close_quantity is negative
-                                    close_price = best_bid_exit
-                                # else: # No liquidity to close or quantity is zero
-                                     # close_price remains None
+                                    if exit_price is not None:
+                                        logger.print(f"SQUID: Placing EXIT order {close_quantity} @ {exit_price}")
+                                        result[symbol_squid].append(Order(symbol_squid, exit_price, close_quantity))
+                                        pending_pos_delta[symbol_squid] = pending_pos_delta.get(symbol_squid, 0) + close_quantity
+                                        self.squid_entry_price = None # Reset entry price after exit
+                                    else:
+                                         logger.print(f"SQUID: Could not determine exit price for closing {close_quantity}")
+                                else:
+                                     logger.print(f"SQUID: Cannot place exit order {close_quantity} due to position limits")
 
-                                if order_qty != 0 and close_price is not None and self._can_place_order(symbol_squid, order_qty, current_pos_squid, pending_pos_delta):
-                                    logger.print(f"SQUID EXIT: Closing {order_qty} @ {close_price} (Dev: {current_deviation:.2f} < {exit_threshold_abs:.2f}, PnL: {pnl_per_unit:.2f}>0)")
-                                    result[symbol_squid].append(Order(symbol_squid, close_price, order_qty))
-                                    pending_pos_delta[symbol_squid] = pending_pos_delta.get(symbol_squid, 0) + order_qty
-                                    # Only reset entry price if fully closed
-                                    if current_pos_squid + pending_pos_delta.get(symbol_squid, 0) == 0:
-                                        self.squid_entry_price = None
 
                         # --- Entry Logic ---
-                        # Only enter if effective position is currently flat AND warmup period is over
-                        elif effective_pos_squid == 0 and self.squid_calc_count > self.squid_warmup_ticks:
-                            upper_band = mean_price + entry_threshold_abs
-                            lower_band = mean_price - entry_threshold_abs
-                            best_ask = min(depth_squid.sell_orders.keys()) if depth_squid.sell_orders else None
-                            best_bid = max(depth_squid.buy_orders.keys()) if depth_squid.buy_orders else None
+                        elif effective_pos_squid == 0:
+                            upper_band = self.squid_ewma + entry_threshold_abs
+                            lower_band = self.squid_ewma - entry_threshold_abs
 
-                            # logger.print(f"SQUID Check Entry (Warmup OK): WAP={wap_squid:.2f}, Lower={lower_band:.2f}, Upper={upper_band:.2f}")
+                            sorted_asks = sorted(depth_squid.sell_orders.items(), key=lambda item: item[0]) if depth_squid.sell_orders else []
+                            sorted_bids = sorted(depth_squid.buy_orders.items(), key=lambda item: item[0], reverse=True) if depth_squid.buy_orders else []
 
-                            # Check for Buy Entry (Price below lower band)
+                            best_ask = sorted_asks[0][0] if sorted_asks else None
+                            best_bid = sorted_bids[0][0] if sorted_bids else None
+
+                            # --- Buy Signal ---
                             if best_ask is not None and best_ask < lower_band:
-                                buy_volume_available = depth_squid.sell_orders[best_ask]
-                                # Calculate capacity based on current pos + pending orders
+                                logger.print(f"SQUID: Potential LONG Entry Signal: Best Ask {best_ask:.2f} < Lower Band {lower_band:.2f}")
                                 buy_capacity = limit_squid - (current_pos_squid + pending_pos_delta.get(symbol_squid, 0))
-                                order_qty = min(buy_volume_available, buy_capacity)
+                                total_target_qty = min(buy_capacity, self.squid_target_entry_volume)
 
-                                if order_qty > 0 and self._can_place_order(symbol_squid, order_qty, current_pos_squid, pending_pos_delta):
-                                    logger.print(f"SQUID ENTRY BUY: {order_qty} @ {best_ask} (Ask {best_ask:.2f} < Lower {lower_band:.2f})")
-                                    result[symbol_squid].append(Order(symbol_squid, best_ask, order_qty))
-                                    pending_pos_delta[symbol_squid] = pending_pos_delta.get(symbol_squid, 0) + order_qty
-                                    self.squid_entry_price = best_ask # Record entry price
+                                # Calculate split
+                                limit_qty_target = math.floor(total_target_qty * self.squid_limit_order_ratio)
+                                aggressive_qty_target = total_target_qty - limit_qty_target
 
-                            # Check for Sell Entry (Price above upper band)
+                                # 1. Place Passive Limit Order (if qty > 0)
+                                if limit_qty_target > 0:
+                                    limit_order_price = best_ask
+                                    limit_order_qty = limit_qty_target # Place for the target amount
+                                    if self._can_place_order(symbol_squid, limit_order_qty, current_pos_squid, pending_pos_delta):
+                                        logger.print(f"SQUID: Placing Passive Limit Entry LONG {limit_order_qty} @ {limit_order_price}")
+                                        result[symbol_squid].append(Order(symbol_squid, limit_order_price, limit_order_qty))
+                                        pending_pos_delta[symbol_squid] += limit_order_qty
+                                        # Don't set entry price yet, wait for aggressive order or fill confirmation (complex)
+                                    else:
+                                        logger.print(f"SQUID: Cannot place passive limit order {limit_order_qty} due to limits.")
+                                        aggressive_qty_target = total_target_qty # If limit fails, try all aggressive
+
+                                # 2. Place Aggressive Order (if qty > 0)
+                                if aggressive_qty_target > 0:
+                                    cumulative_volume_agg = 0
+                                    aggressive_price = None
+                                    levels_checked_agg = 0
+                                    # Calculate volume and price by sweeping levels for the aggressive portion
+                                    for ask_price, ask_vol in sorted_asks:
+                                        if levels_checked_agg >= self.squid_max_levels_sweep:
+                                            break
+                                        vol_to_take = min(ask_vol, aggressive_qty_target - cumulative_volume_agg)
+                                        if vol_to_take > 0:
+                                            cumulative_volume_agg += vol_to_take
+                                            aggressive_price = ask_price # Price gets worse as we go deeper
+                                        levels_checked_agg += 1
+                                        if cumulative_volume_agg >= aggressive_qty_target:
+                                            break # Filled target
+
+                                    if cumulative_volume_agg > 0 and aggressive_price is not None:
+                                        final_order_qty_agg = cumulative_volume_agg
+                                        final_order_price_agg = aggressive_price
+
+                                        if self._can_place_order(symbol_squid, final_order_qty_agg, current_pos_squid, pending_pos_delta):
+                                            logger.print(f"SQUID: Placing Aggressive Entry LONG {final_order_qty_agg} @ {final_order_price_agg} (Target: {aggressive_qty_target}, Levels: {levels_checked_agg})")
+                                            result[symbol_squid].append(Order(symbol_squid, final_order_price_agg, final_order_qty_agg))
+                                            pending_pos_delta[symbol_squid] += final_order_qty_agg
+                                            # Set entry price based on the aggressive order for simplicity
+                                            self.squid_entry_price = final_order_price_agg
+                                        else:
+                                            logger.print(f"SQUID: Cannot place aggressive entry order {final_order_qty_agg} due to limits.")
+                                    else:
+                                        logger.print(f"SQUID: Aggressive LONG Entry: No volume found or price unavailable for target {aggressive_qty_target}.")
+                                else:
+                                     logger.print(f"SQUID: No aggressive LONG portion needed (Target: {aggressive_qty_target}).")
+
+
+                            # --- Sell Signal ---
                             elif best_bid is not None and best_bid > upper_band:
-                                sell_volume_available = depth_squid.buy_orders[best_bid]
-                                # Sell capacity based on current pos + pending orders
+                                logger.print(f"SQUID: Potential SHORT Entry Signal: Best Bid {best_bid:.2f} > Upper Band {upper_band:.2f}")
                                 sell_capacity = limit_squid + (current_pos_squid + pending_pos_delta.get(symbol_squid, 0))
-                                order_qty = -min(sell_volume_available, sell_capacity) # Negative for sell order
+                                total_target_qty = min(sell_capacity, self.squid_target_entry_volume) # Target is positive volume
 
-                                if order_qty < 0 and self._can_place_order(symbol_squid, order_qty, current_pos_squid, pending_pos_delta):
-                                    logger.print(f"SQUID ENTRY SELL: {order_qty} @ {best_bid} (Bid {best_bid:.2f} > Upper {upper_band:.2f})")
-                                    result[symbol_squid].append(Order(symbol_squid, best_bid, order_qty))
-                                    pending_pos_delta[symbol_squid] = pending_pos_delta.get(symbol_squid, 0) + order_qty
-                                    self.squid_entry_price = best_bid # Record entry price
-                        # else:
-                            # if effective_pos_squid == 0:
-                                # logger.print(f"SQUID: Entry skipped, warmup not complete ({self.squid_calc_count}/{self.squid_warmup_ticks})")
+                                # Calculate split
+                                limit_qty_target = math.floor(total_target_qty * self.squid_limit_order_ratio)
+                                aggressive_qty_target = total_target_qty - limit_qty_target
 
+                                # 1. Place Passive Limit Order (if qty > 0)
+                                if limit_qty_target > 0:
+                                    limit_order_price = best_bid
+                                    limit_order_qty = -limit_qty_target # Negative for sell
+                                    if self._can_place_order(symbol_squid, limit_order_qty, current_pos_squid, pending_pos_delta):
+                                        logger.print(f"SQUID: Placing Passive Limit Entry SHORT {limit_order_qty} @ {limit_order_price}")
+                                        result[symbol_squid].append(Order(symbol_squid, limit_order_price, limit_order_qty))
+                                        pending_pos_delta[symbol_squid] += limit_order_qty
+                                        # Don't set entry price yet
+                                    else:
+                                        logger.print(f"SQUID: Cannot place passive limit order {limit_order_qty} due to limits.")
+                                        aggressive_qty_target = total_target_qty # If limit fails, try all aggressive
 
-                except statistics.StatisticsError:
-                    logger.print("SQUID: Not enough data or zero variance for volatility calculation.")
-                except Exception as e:
-                    logger.print(f"SQUID: Error during strategy logic: {e}")
+                                # 2. Place Aggressive Order (if qty > 0)
+                                if aggressive_qty_target > 0:
+                                    cumulative_volume_agg = 0
+                                    aggressive_price = None
+                                    levels_checked_agg = 0
+                                    # Calculate volume and price by sweeping levels for the aggressive portion
+                                    for bid_price, bid_vol in sorted_bids:
+                                        if levels_checked_agg >= self.squid_max_levels_sweep:
+                                            break
+                                        vol_to_take = min(bid_vol, aggressive_qty_target - cumulative_volume_agg)
+                                        if vol_to_take > 0:
+                                            cumulative_volume_agg += vol_to_take
+                                            aggressive_price = bid_price # Price gets worse (lower)
+                                        levels_checked_agg += 1
+                                        if cumulative_volume_agg >= aggressive_qty_target:
+                                            break # Filled target
+
+                                    if cumulative_volume_agg > 0 and aggressive_price is not None:
+                                        final_order_qty_agg = -cumulative_volume_agg # Negative for sell
+                                        final_order_price_agg = aggressive_price
+
+                                        if self._can_place_order(symbol_squid, final_order_qty_agg, current_pos_squid, pending_pos_delta):
+                                            logger.print(f"SQUID: Placing Aggressive Entry SHORT {final_order_qty_agg} @ {final_order_price_agg} (Target: {aggressive_qty_target}, Levels: {levels_checked_agg})")
+                                            result[symbol_squid].append(Order(symbol_squid, final_order_price_agg, final_order_qty_agg))
+                                            pending_pos_delta[symbol_squid] += final_order_qty_agg
+                                            # Set entry price based on the aggressive order for simplicity
+                                            self.squid_entry_price = final_order_price_agg
+                                        else:
+                                            logger.print(f"SQUID: Cannot place aggressive entry order {final_order_qty_agg} due to limits.")
+                                    else:
+                                        logger.print(f"SQUID: Aggressive SHORT Entry: No volume found or price unavailable for target {aggressive_qty_target}.")
+                                else:
+                                     logger.print(f"SQUID: No aggressive SHORT portion needed (Target: {aggressive_qty_target}).")
+
+                    except Exception as e:
+                        logger.print(f"SQUID: Error during strategy logic: {e}")
+                # else:
+                    # logger.print(f"SQUID @ {state.timestamp}: Conditions not met for trading (EWMA/EWMSD invalid or EWMSD too small)")
             # else:
-                # if len(self.squid_prices) < self.squid_hv_window:
-                    # logger.print(f"SQUID: Filling price data ({len(self.squid_prices)}/{self.squid_hv_window})")
-                # elif wap_squid is None:
-                    # logger.print("SQUID: No WAP available.")
-
+                # logger.print(f"SQUID @ {state.timestamp}: WAP calculation failed.")
+        # --- End SQUID_INK Logic ---
 
         # --- Final Steps ---
-        conversions = 0 # No conversions logic implemented
-        trader_data = self._serialize_trader_data() # Serialize state using jsonpickle
+        conversions = 0
+        trader_data = self._serialize_trader_data()
 
-        # Log final orders placed
         orders_to_log = {symbol: orders for symbol, orders in result.items() if orders}
         if orders_to_log:
              logger.print(f"Timestamp: {state.timestamp}, Final Orders: {orders_to_log}")
 
-        # Update previous positions AFTER all logic for the current timestamp is done
         self.previous_positions = state.position.copy()
 
-        # Flush the logs, orders, conversions, and trader data to standard output
-        # Logger uses standard json, trader_data string is already serialized via jsonpickle
         logger.flush(state, result, conversions, trader_data)
 
-        # Return the orders, conversions, and trader data
         return result, conversions, trader_data
 
-    # Kept log_position_changes for debugging/monitoring
     def log_position_changes(self, current_positions: dict[Symbol, int], timestamp: int) -> None:
         """
         Log changes in positions compared to the start of the previous run.
         """
         log_entry = []
         all_symbols = set(current_positions.keys()) | set(self.previous_positions.keys())
-        # Log for all traded symbols now
-        symbols_to_log = ["RAINFOREST_RESIN", "KELP", "SQUID_INK"] # Add SQUID_INK
+        symbols_to_log = ["RAINFOREST_RESIN", "KELP", "SQUID_INK"]
         for symbol in symbols_to_log:
             if symbol not in all_symbols: continue
             prev_pos = self.previous_positions.get(symbol, 0)
@@ -547,5 +656,3 @@ class Trader:
 
         if log_entry:
             logger.print(f"Pos Changes @ {timestamp}: {', '.join(log_entry)}")
-
-    # Removed to_json from Trader class as Logger handles final output JSON
