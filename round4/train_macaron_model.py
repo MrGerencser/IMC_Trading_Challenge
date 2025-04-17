@@ -8,7 +8,7 @@ import sys
 # --- Configuration ---
 ROUND_NUM = 4
 # Use all available historical days for training
-DAY_NUM = [1]
+DAY_NUM = [1,2,3]
 PRODUCT = 'MAGNIFICENT_MACARONS'
 # Features to use for prediction (must match columns available after merging)
 # Ensure these are the columns you want to use as predictors
